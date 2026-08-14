@@ -1,0 +1,30 @@
+[build-system]
+requires = [
+    "setuptools >= 77",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reef-client"
+version = "0.1.0"
+description = "Stdlib-only client SDK for the Reef protocol"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Human-Agent-Society" }]
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+# reef_client is a client of the Reef wire protocol, not of the reef package:
+# it never imports reef, and zero dependencies is a hard requirement —
+# harnesses run in environments that cannot take the reef wheel's
+# dependencies. Keep this list empty.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Human-Agent-Society/reef"
+
+[tool.setuptools]
+packages = ["reef_client"]
