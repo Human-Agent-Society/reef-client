@@ -3,8 +3,7 @@
 The skill component of the ``reef_client`` SDK, standard library only. It
 reads the scenario's harness manifest (``GET /reef/harness``), extracts
 ``skills/SKILL.md``, and can write it to a local path only when the content
-changed. ``examples/skill_pull`` builds a session-start sync hook on these
-helpers.
+changed.
 """
 
 from __future__ import annotations

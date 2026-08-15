@@ -14,8 +14,6 @@ This directory is its own distribution (`reef-client`,
   [`docs/reference/reef-client.md`](../docs/reference/reef-client.md)).
 - [`skill.py`](reef_client/skill.py) fetches and syncs the scenario's served
   skill file (`fetch_skill`/`sync_skill`);
-  [`examples/skill_pull`](../examples/skill_pull) builds a session-start sync
-  hook on them.
 - [`sse.py`](reef_client/sse.py) converts between buffered chat completions
   and OpenAI-style SSE chunk streams in both directions
   (`synthesize_sse_events` / `SSEAccumulator`).
