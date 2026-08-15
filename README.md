@@ -16,9 +16,18 @@ This directory is its own distribution (`reef-client`,
   skill file (`fetch_skill`/`sync_skill`);
   [`examples/skill_pull`](../examples/skill_pull) builds a session-start sync
   hook on them.
+- [`sse.py`](reef_client/sse.py) converts between buffered chat completions
+  and OpenAI-style SSE chunk streams in both directions
+  (`synthesize_sse_events` / `SSEAccumulator`).
+- [`serve.py`](reef_client/serve.py) is serve mode: a local sidecar that
+  agents treat as their model endpoint (`python -m reef_client.serve`),
+  owning session stamping, trajectory capture, receipt collection, and SSE
+  passthrough/synthesis so reef-oblivious agents need no SDK. See the
+  [reference](../docs/reference/reef-client.md#serve-mode-a-local-proxy-for-reef-oblivious-agents).
 
-Both are re-exported at the package root: `from reef_client import ReefClient,
-fetch_skill, sync_skill`.
+The client and skill helpers are re-exported at the package root:
+`from reef_client import ReefClient, fetch_skill, sync_skill`. Import the
+`sse`/`serve` submodules directly.
 
 ## Use it
 
