@@ -48,7 +48,7 @@ import re
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -154,6 +154,13 @@ class ServeConfig:
     # forwarded calls for which ``stamp_when(body, method)`` is true.
     session_header: str | None = None
     stamp_when: Callable[[dict[str, Any] | None, str], bool] = lambda body, method: method == "POST"
+    # Static headers added to every forwarded call (client-sent values win):
+    # e.g. reef's x-reef-scenario / authorization when fronting reef directly.
+    extra_headers: Mapping[str, str] = field(default_factory=dict)
+    # Static headers that REPLACE client-sent values. OpenAI-compatible
+    # clients always send their own ``Authorization: Bearer <api_key>``, so a
+    # shim that owns the upstream's auth must override, never setdefault.
+    override_headers: Mapping[str, str] = field(default_factory=dict)
     # Buffer upstream calls (strip stream/stream_options) and re-synthesize
     # SSE for streaming clients — required when the upstream needs the
     # complete response for capture (e.g. reef's training block).
@@ -288,6 +295,15 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
             if session_id and config.session_header and config.stamp_when(body_json, self.command):
                 headers.setdefault(config.session_header, session_id)
                 stamped = session_id
+            for name, value in config.extra_headers.items():
+                headers.setdefault(name, value)
+            if config.override_headers:
+                headers = {
+                    name: value
+                    for name, value in headers.items()
+                    if name.lower() not in {key.lower() for key in config.override_headers}
+                }
+                headers.update(config.override_headers)
             if forward_body is not None:
                 headers["Content-Length"] = str(len(forward_body))
 
