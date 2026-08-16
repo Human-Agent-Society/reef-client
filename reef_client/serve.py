@@ -336,6 +336,7 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
                             time.monotonic() - started,
                         )
                     )
+                self.wfile.write(b"0\r\n\r\n")
                 return
 
             payload = response.read()
@@ -404,7 +405,6 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
                 accumulator.feed(chunk)
                 self._write_chunk(chunk)
             accumulator.finish()
-            self.wfile.write(b"0\r\n\r\n")
             return accumulator
 
     return Handler
