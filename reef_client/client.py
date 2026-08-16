@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 
@@ -77,12 +77,28 @@ class ReefClient:
     def report(
         self,
         scenario: str,
-        payload: Mapping[str, Any],
+        payload: Mapping[str, Any] | Any,
         *,
+        references: Sequence[str] | None = None,
         recipe: str | None = None,
         artifact_version: str | None = None,
         extra_headers: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
+        """POST a report: a plain wire dict, or a typed signal instance.
+
+        Any object with a ``to_report(references=...)`` method (a recipe's
+        declared ``reef.schemas.ReportSchema`` dataclass) is serialized through it,
+        so the report body is built — and validated — by the contract's own
+        code before the request leaves the process. ``references`` are the
+        inference ``x-reef-agent-data-id`` receipts this report grades; with
+        a plain dict they merge into the payload (the dict's own
+        ``references`` key wins).
+        """
+        to_report = getattr(payload, "to_report", None)
+        if callable(to_report):
+            payload = to_report(references=tuple(references or ()))
+        elif references is not None:
+            payload = {"references": list(references), **payload}
         return self._post(
             "/reef/report",
             scenario,
