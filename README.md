@@ -1,6 +1,6 @@
 # reef_client
 
-Stdlib-only client SDK for the Reef protocol. `reef_client` is a client of
+Stdlib-only client SDK for the [Reef](https://github.com/Human-Agent-Society/reef) protocol. `reef_client` is a client of
 Reef's HTTP wire protocol, not of the `reef` package: it never imports `reef`
 and has no dependencies, so external harnesses can install it or copy it into
 environments that cannot take the `reef` wheel's dependencies.
