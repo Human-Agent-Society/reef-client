@@ -11,7 +11,10 @@ This directory is its own distribution (`reef-client`,
 
 - [`client.py`](reef_client/client.py) is `ReefClient`, the
   ask/observe/report loop every example shares (see
-  [`docs/reference/reef-client.md`](../docs/reference/reef-client.md)).
+  [`docs/reference/reef-client.md`](../docs/reference/reef-client.md)), plus
+  the harness update channel reads: `harness_versions` (the version catalog
+  with gate metrics) and `harness_pull` (write one served tree, head or
+  version-addressed, into a directory).
 - [`skill.py`](reef_client/skill.py) fetches and syncs the scenario's served
   skill file (`fetch_skill`/`sync_skill`);
 - [`sse.py`](reef_client/sse.py) converts between buffered chat completions
