@@ -24,7 +24,9 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/Human-Agent-Society/reef"
+Homepage = "https://github.com/Human-Agent-Society/reef-client"
+Repository = "https://github.com/Human-Agent-Society/reef-client"
+Issues = "https://github.com/Human-Agent-Society/reef-client/issues"
 
 [tool.setuptools]
 packages = ["reef_client"]
