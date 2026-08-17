@@ -115,24 +115,6 @@ class ReefClient:
             extra_headers=extra_headers,
         )
 
-    def event(
-        self,
-        scenario: str,
-        payload: Mapping[str, Any],
-        *,
-        recipe: str | None = None,
-        artifact_version: str | None = None,
-        extra_headers: Mapping[str, str] | None = None,
-    ) -> dict[str, Any]:
-        return self._post(
-            "/reef/event",
-            scenario,
-            payload,
-            recipe=recipe,
-            artifact_version=artifact_version,
-            extra_headers=extra_headers,
-        )
-
     def post(
         self,
         path: str,
@@ -145,8 +127,8 @@ class ReefClient:
     ) -> tuple[dict[str, Any], Mapping[str, str]]:
         """POST an arbitrary protocol path; return (parsed body, response headers).
 
-        This is the low-level entry point behind ``inference``/``report``/
-        ``event``, exposed for callers that need the response headers (e.g. a
+        This is the low-level entry point behind ``inference``/``report``,
+        exposed for callers that need the response headers (e.g. a
         forwarding proxy capturing the ``x-reef-agent-data-id`` receipt, where
         a missing receipt is tolerated rather than an error) or that mirror
         upstream behavior. Response header names are lowercased.
