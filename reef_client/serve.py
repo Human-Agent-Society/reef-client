@@ -182,6 +182,9 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        #: Set once a write to the agent fails; the relay then drains the
+        #: upstream in silence so the turn is still captured.
+        _client_gone = False
 
         def log_message(self, fmt: str, *args: Any) -> None:  # quiet
             pass
@@ -192,7 +195,7 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self._write_to_client(body)
 
         def _route(self) -> tuple[str, str | None]:
             """Split the request target into (forward_path, routed session id)."""
@@ -265,8 +268,27 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
             with contextlib.suppress(Exception):
                 self._reply_json(status, {"error": {"message": message}})
 
+        def _write_to_client(self, data: bytes) -> bool:
+            """Write to the agent, tolerating an agent that has gone away.
+
+            A client that times out, is killed, or simply stops reading is an
+            ordinary event for a sidecar, not a fault: the exchange upstream
+            already happened and its capture is what the harness came for.
+            Letting the write raise loses that capture and prints a traceback
+            for something nobody can act on, so the disconnect is recorded and
+            the relay is allowed to finish.
+            """
+            if self._client_gone:
+                return False
+            try:
+                self.wfile.write(data)
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                self._client_gone = True
+                return False
+
         def _write_chunk(self, data: bytes) -> None:
-            self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+            self._write_to_client(f"{len(data):X}\r\n".encode() + data + b"\r\n")
             self.wfile.flush()
 
         def _forward(self, forward_path: str, routed_session: str | None) -> None:
@@ -352,7 +374,7 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
                             time.monotonic() - started,
                         )
                     )
-                self.wfile.write(b"0\r\n\r\n")
+                self._write_to_client(b"0\r\n\r\n")
                 return
 
             payload = response.read()
@@ -385,7 +407,7 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
                     self.send_header(key, value)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                self._write_to_client(payload)
                 return
 
             # The client asked for a stream but the upstream answered a
@@ -402,7 +424,7 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
             self.end_headers()
             for event in synthesize_sse_events(completion, include_usage=include_usage):
                 self._write_chunk(event.encode())
-            self.wfile.write(b"0\r\n\r\n")
+            self._write_to_client(b"0\r\n\r\n")
 
         def _relay_stream(self, response: http.client.HTTPResponse, receipt: str | None) -> SSEAccumulator:
             self.send_response(response.status)

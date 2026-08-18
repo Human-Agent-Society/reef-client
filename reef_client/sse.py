@@ -111,7 +111,15 @@ class SSEAccumulator:
         if data == "[DONE]":
             self.done = True
             return
-        self._apply_chunk(json.loads(data))
+        try:
+            chunk = json.loads(data)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # A malformed frame costs its own content, never the stream: the
+            # relay is mid-flight to the client and the turn is still worth
+            # capturing from the frames that do parse.
+            return
+        if isinstance(chunk, dict):
+            self._apply_chunk(chunk)
 
     def _apply_chunk(self, chunk: dict[str, Any]) -> None:
         self.id = chunk.get("id") or self.id
