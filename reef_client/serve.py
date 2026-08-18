@@ -69,7 +69,7 @@ _HOP_BY_HOP = {
     "content-length",  # always recomputed for the forwarded body
 }
 
-RECEIPT_HEADER = "x-reef-agent-data-id"
+RECEIPT_HEADER = "x-reef-agent-record-id"
 
 SESSION_PREFIX = "/s/"
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9._~-]+")
