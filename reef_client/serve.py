@@ -182,6 +182,12 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        #: Set once a write to the agent fails; the relay then drains the
+        #: upstream in silence so the turn is still captured.
+        _client_gone = False
+        #: Set once the SSE response head has been committed to the agent —
+        #: from then on a failure travels as an SSE error event, not a status.
+        _sse_head_sent = False
 
         def log_message(self, fmt: str, *args: Any) -> None:  # quiet
             pass
@@ -192,7 +198,7 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self._write_to_client(body)
 
         def _route(self) -> tuple[str, str | None]:
             """Split the request target into (forward_path, routed session id)."""
@@ -265,9 +271,58 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
             with contextlib.suppress(Exception):
                 self._reply_json(status, {"error": {"message": message}})
 
+        def _write_to_client(self, data: bytes) -> bool:
+            """Write to the agent, tolerating an agent that has gone away.
+
+            A client that times out, is killed, or simply stops reading is an
+            ordinary event for a sidecar, not a fault: the exchange upstream
+            already happened and its capture is what the harness came for.
+            Letting the write raise loses that capture and prints a traceback
+            for something nobody can act on, so the disconnect is recorded and
+            the relay is allowed to finish.
+            """
+            if self._client_gone:
+                return False
+            try:
+                self.wfile.write(data)
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                self._client_gone = True
+                return False
+
         def _write_chunk(self, data: bytes) -> None:
-            self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+            self._write_to_client(f"{len(data):X}\r\n".encode() + data + b"\r\n")
             self.wfile.flush()
+
+        def _begin_sse(self) -> None:
+            """Commit the SSE response head before reef has answered.
+
+            Agents often sit behind a transparent egress proxy whose deadline
+            for a response head is seconds (harbor's gost sidecar: 15s), while
+            reef legitimately stalls for minutes — a weight publish pauses the
+            engine mid-update. A streaming client asked for SSE, so the head
+            carries no information worth waiting for; sending it immediately
+            makes the head latency a property of this process, not of GPU
+            load. The price: the receipt header cannot ride a streamed reply
+            (it is not known yet) — it stays available in the capture.
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.flush()
+            self._sse_head_sent = True
+
+        def _stream_error(self, message: str, status: int = 502) -> None:
+            """After the head is committed, an error is an event, not a status.
+
+            An OpenAI-style client parses the error payload and raises — a far
+            better failure than the cut socket it would otherwise see.
+            """
+            event = {"error": {"message": message, "type": "reef_client_serve", "code": status}}
+            self._write_chunk(f"data: {json.dumps(event)}\n\n".encode())
+            self._write_to_client(b"0\r\n\r\n")
 
         def _forward(self, forward_path: str, routed_session: str | None) -> None:
             length = int(self.headers.get("Content-Length", 0))
@@ -307,13 +362,22 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
             if forward_body is not None:
                 headers["Content-Length"] = str(len(forward_body))
 
+            # The head goes out before reef is even contacted: from here on
+            # nothing between the agent and this process can time the response
+            # head out, no matter how long the engine stalls.
+            if client_stream:
+                self._begin_sse()
+
             conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=config.timeout_s)
             started = time.monotonic()
             try:
                 conn.request(self.command, forward_path, body=forward_body, headers=headers)
                 response = conn.getresponse()
             except Exception as exc:
-                self._send_error_json(502, f"reef-client serve: {exc}")
+                if self._sse_head_sent:
+                    self._stream_error(f"reef-client serve: {exc}")
+                else:
+                    self._send_error_json(502, f"reef-client serve: {exc}")
                 conn.close()
                 return
 
@@ -352,7 +416,7 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
                             time.monotonic() - started,
                         )
                     )
-                self.wfile.write(b"0\r\n\r\n")
+                self._write_to_client(b"0\r\n\r\n")
                 return
 
             payload = response.read()
@@ -376,6 +440,18 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
                     )
                 )
 
+            if self._sse_head_sent:
+                # The head is committed: an upstream failure becomes an error
+                # event, a buffered completion is re-synthesized as SSE.
+                if response.status >= 400 or completion is None:
+                    detail = payload.decode("utf-8", "replace")[:2048] or "empty upstream response"
+                    self._stream_error(detail, status=response.status)
+                    return
+                for event in synthesize_sse_events(completion, include_usage=include_usage):
+                    self._write_chunk(event.encode())
+                self._write_to_client(b"0\r\n\r\n")
+                return
+
             if not client_stream or response.status >= 400:
                 # Buffered relay; upstream errors keep their status verbatim.
                 self.send_response(response.status)
@@ -385,7 +461,7 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
                     self.send_header(key, value)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                self._write_to_client(payload)
                 return
 
             # The client asked for a stream but the upstream answered a
@@ -402,16 +478,17 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
             self.end_headers()
             for event in synthesize_sse_events(completion, include_usage=include_usage):
                 self._write_chunk(event.encode())
-            self.wfile.write(b"0\r\n\r\n")
+            self._write_to_client(b"0\r\n\r\n")
 
         def _relay_stream(self, response: http.client.HTTPResponse, receipt: str | None) -> SSEAccumulator:
-            self.send_response(response.status)
-            for key, value in response.getheaders():
-                if key.lower() in _HOP_BY_HOP:
-                    continue
-                self.send_header(key, value)
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
+            if not self._sse_head_sent:
+                self.send_response(response.status)
+                for key, value in response.getheaders():
+                    if key.lower() in _HOP_BY_HOP:
+                        continue
+                    self.send_header(key, value)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
 
             accumulator = SSEAccumulator()
             while True:
