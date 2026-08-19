@@ -93,17 +93,17 @@ class ReefClient:
     ) -> dict[str, Any]:
         """POST a report: a plain wire dict, or a typed signal instance.
 
-        Any object with a ``to_report(references=...)`` method (a recipe's
-        declared ``reef.schemas.ReportSchema`` dataclass) is serialized through it,
+        Any object with a ``to_dict(references=...)`` method (a recipe's
+        declared ``reef.schemas.Report`` dataclass) is serialized through it,
         so the report body is built — and validated — by the contract's own
         code before the request leaves the process. ``references`` are the
         inference ``x-reef-agent-record-id`` receipts this report grades; with
         a plain dict they merge into the payload (the dict's own
         ``references`` key wins).
         """
-        to_report = getattr(payload, "to_report", None)
-        if callable(to_report):
-            payload = to_report(references=tuple(references or ()))
+        to_dict = getattr(payload, "to_dict", None)
+        if callable(to_dict):
+            payload = to_dict(references=tuple(references or ()))
         elif references is not None:
             payload = {"references": list(references), **payload}
         return self._post(
