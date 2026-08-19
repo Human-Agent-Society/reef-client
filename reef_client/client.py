@@ -76,10 +76,10 @@ class ReefClient:
             artifact_version=artifact_version,
             extra_headers=extra_headers,
         )
-        agent_data_id = headers.get("x-reef-agent-data-id")
-        if not agent_data_id:
-            raise ReefClientError(502, "inference response is missing x-reef-agent-data-id")
-        return body, agent_data_id
+        agent_record_id = headers.get("x-reef-agent-record-id")
+        if not agent_record_id:
+            raise ReefClientError(502, "inference response is missing x-reef-agent-record-id")
+        return body, agent_record_id
 
     def report(
         self,
@@ -93,17 +93,17 @@ class ReefClient:
     ) -> dict[str, Any]:
         """POST a report: a plain wire dict, or a typed signal instance.
 
-        Any object with a ``to_report(references=...)`` method (a recipe's
-        declared ``reef.schemas.ReportSchema`` dataclass) is serialized through it,
+        Any object with a ``to_dict(references=...)`` method (a recipe's
+        declared ``reef.schemas.Report`` dataclass) is serialized through it,
         so the report body is built — and validated — by the contract's own
         code before the request leaves the process. ``references`` are the
-        inference ``x-reef-agent-data-id`` receipts this report grades; with
+        inference ``x-reef-agent-record-id`` receipts this report grades; with
         a plain dict they merge into the payload (the dict's own
         ``references`` key wins).
         """
-        to_report = getattr(payload, "to_report", None)
-        if callable(to_report):
-            payload = to_report(references=tuple(references or ()))
+        to_dict = getattr(payload, "to_dict", None)
+        if callable(to_dict):
+            payload = to_dict(references=tuple(references or ()))
         elif references is not None:
             payload = {"references": list(references), **payload}
         return self._post(
@@ -129,7 +129,7 @@ class ReefClient:
 
         This is the low-level entry point behind ``inference``/``report``,
         exposed for callers that need the response headers (e.g. a
-        forwarding proxy capturing the ``x-reef-agent-data-id`` receipt, where
+        forwarding proxy capturing the ``x-reef-agent-record-id`` receipt, where
         a missing receipt is tolerated rather than an error) or that mirror
         upstream behavior. Response header names are lowercased.
         """

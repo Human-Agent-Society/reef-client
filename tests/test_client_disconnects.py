@@ -37,7 +37,7 @@ class _Upstream(BaseHTTPRequestHandler):
         self.rfile.read(int(self.headers.get("Content-Length", 0)))
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("x-reef-agent-data-id", "receipt-1")
+        self.send_header("x-reef-agent-record-id", "receipt-1")
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
         for chunk in CHUNKS:
