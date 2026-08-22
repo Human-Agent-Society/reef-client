@@ -402,7 +402,8 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
             capture = forward_path in config.capture_paths and request_json is not None
 
             if is_sse:
-                accumulator = self._relay_stream(response, receipt)
+                accumulator = self._relay_stream(response)
+                receipt = accumulator.agent_record_id or receipt
                 if capture:
                     store.add(
                         CapturedTurn(
@@ -447,7 +448,11 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
                     detail = payload.decode("utf-8", "replace")[:2048] or "empty upstream response"
                     self._stream_error(detail, status=response.status)
                     return
-                for event in synthesize_sse_events(completion, include_usage=include_usage):
+                for event in synthesize_sse_events(
+                    completion,
+                    include_usage=include_usage,
+                    agent_record_id=receipt,
+                ):
                     self._write_chunk(event.encode())
                 self._write_to_client(b"0\r\n\r\n")
                 return
@@ -470,17 +475,19 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
                 self._send_error_json(502, "reef-client serve: upstream returned non-JSON for a streaming request")
                 return
             self.send_response(200)
-            if receipt:
-                self.send_header(RECEIPT_HEADER, receipt)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            for event in synthesize_sse_events(completion, include_usage=include_usage):
+            for event in synthesize_sse_events(
+                completion,
+                include_usage=include_usage,
+                agent_record_id=receipt,
+            ):
                 self._write_chunk(event.encode())
             self._write_to_client(b"0\r\n\r\n")
 
-        def _relay_stream(self, response: http.client.HTTPResponse, receipt: str | None) -> SSEAccumulator:
+        def _relay_stream(self, response: http.client.HTTPResponse) -> SSEAccumulator:
             if not self._sse_head_sent:
                 self.send_response(response.status)
                 for key, value in response.getheaders():

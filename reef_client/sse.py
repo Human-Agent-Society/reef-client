@@ -8,7 +8,8 @@ Two directions, both stdlib-only:
   streaming clients must still receive a protocol-valid stream.
 * ``SSEAccumulator`` does the inverse: it consumes a live
   ``chat.completion.chunk`` stream and rebuilds the buffered completion,
-  so a passthrough proxy can capture trajectories without delaying the
+  while retaining Reef's terminal ``agent_record_id`` receipt, so a
+  passthrough proxy can capture trajectories without delaying the
   client-facing stream.
 """
 
@@ -19,7 +20,12 @@ import json
 from typing import Any
 
 
-def synthesize_sse_events(payload: dict[str, Any], *, include_usage: bool = False) -> list[str]:
+def synthesize_sse_events(
+    payload: dict[str, Any],
+    *,
+    include_usage: bool = False,
+    agent_record_id: str | None = None,
+) -> list[str]:
     """Re-emit one buffered chat completion as OpenAI stream events.
 
     Content and tool calls each arrive as a single delta rather than
@@ -68,6 +74,10 @@ def synthesize_sse_events(payload: dict[str, Any], *, include_usage: bool = Fals
         events.append(
             f"data: {json.dumps({**base, 'choices': [], 'usage': payload['usage']}, ensure_ascii=False)}\n\n"
         )
+    if agent_record_id is not None:
+        events.append(
+            f"data: {json.dumps({**base, 'choices': [], 'reef': {'agent_record_id': agent_record_id}}, ensure_ascii=False)}\n\n"
+        )
     events.append("data: [DONE]\n\n")
     return events
 
@@ -89,6 +99,7 @@ class SSEAccumulator:
         self.model = ""
         self.created = 0
         self.usage: dict[str, Any] | None = None
+        self.agent_record_id: str | None = None
         self._choices: dict[int, dict[str, Any]] = {}
 
     def feed(self, data: bytes) -> None:
@@ -127,6 +138,9 @@ class SSEAccumulator:
         self.created = chunk.get("created") or self.created
         if chunk.get("usage") is not None:
             self.usage = chunk["usage"]
+        reef = chunk.get("reef")
+        if isinstance(reef, dict) and isinstance(reef.get("agent_record_id"), str):
+            self.agent_record_id = reef["agent_record_id"]
         for choice in chunk.get("choices") or []:
             index = choice.get("index", 0)
             slot = self._choices.setdefault(
