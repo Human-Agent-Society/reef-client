@@ -172,6 +172,8 @@ class ServeConfig:
     def __post_init__(self) -> None:
         if not self.upstream:
             raise ValueError("upstream must be non-empty")
+        if urlsplit(self.upstream).scheme not in ("http", "https"):
+            raise ValueError(f"upstream must be an http or https URL, got {self.upstream!r}")
 
 
 def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequestHandler]:
@@ -368,7 +370,14 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
             if client_stream:
                 self._begin_sse()
 
-            conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=config.timeout_s)
+            # The upstream's own scheme: an https upstream (the API platform) over a plain connection is
+            # answered with a redirect and an empty body, which the agent sees as an empty completion.
+            if parsed.scheme == "https":
+                conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                    parsed.hostname, parsed.port, timeout=config.timeout_s
+                )
+            else:
+                conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=config.timeout_s)
             started = time.monotonic()
             try:
                 conn.request(self.command, forward_path, body=forward_body, headers=headers)
