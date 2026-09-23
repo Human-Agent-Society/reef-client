@@ -44,3 +44,50 @@ pip install -e .
 
 The package is standard library only — copying the inner `reef_client/`
 directory into your harness works too.
+
+## Import existing records
+
+Run the importer on the machine holding your data, pointing it at a running
+Reef service that supports `POST /reef/records/batch`:
+
+```bash
+reef-client import records.jsonl --url https://reef.example.com --scenario my-agent
+# Also works without a console-script installation:
+python -m reef_client import records.jsonl --url https://reef.example.com --scenario my-agent
+```
+
+No `reef-infra`, training libraries, or third-party HTTP client is required.
+Authentication is read from `REEF_TOKEN` when set.
+
+Each UTF-8 JSONL line is an existing record envelope. IDs must stay stable and
+reports must follow their referenced inferences:
+
+```jsonl
+{"agent_record_id":"sample-1","request_type":"inference","payload":{"messages":[{"role":"user","content":"2+2?"}],"response":{"choices":[{"message":{"role":"assistant","content":"4"}}]}}}
+{"agent_record_id":"score-1","request_type":"report","payload":{"references":["sample-1"],"score":1}}
+```
+
+The selected server recipe determines which inference payload and feedback fields
+it needs. The importer preserves IDs and payloads; it does not run inference or
+convert arbitrary dataset schemas.
+
+- Reads incrementally, limiting each request by `--batch-size` (default 128)
+  and `--max-batch-bytes` (default 524288). Requests must stay below 1 MiB and
+  contain at most 1000 records. Each source line must fit the byte limit.
+- Reuses the HTTP connection and retries transient failures with backoff
+  (`--retries`, default 3). It sends unchanged record IDs on retry.
+- Saves acknowledged byte offsets to `FILE.reef-import.json`, or `--progress PATH`.
+  Re-run the same command after interruption. A full bounded-memory checksum pass
+  verifies the source on each invocation before seeking to saved progress.
+- Binds the checkpoint to the file checksum, service URL and scenario, and locks
+  it against concurrent importers. Keep the source immutable. Checkpoints contain
+  no token or record payloads. POSIX file locking requires Linux/macOS.
+- Stops on permanent failures without advancing the failed batch's checkpoint.
+  Previously acknowledged batches remain stored. Lost responses can be retried
+  safely because the server deduplicates stable record IDs.
+
+Python callers can use `reef_client.record_import.import_records_file(Path(...),
+url=..., scenario=...)`. It returns the cumulative number of acknowledged source
+rows, including existing records; it does not count completed training samples.
+After import, continue sending chat/report traffic to the same scenario.
+Import completion means records were acknowledged, not that training has finished.
