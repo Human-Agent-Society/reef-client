@@ -23,6 +23,9 @@ classifiers = [
 # dependencies. Keep this list empty.
 dependencies = []
 
+[project.scripts]
+reef-client = "reef_client.__main__:main"
+
 [project.urls]
 Homepage = "https://github.com/Human-Agent-Society/reef-client"
 Repository = "https://github.com/Human-Agent-Society/reef-client"

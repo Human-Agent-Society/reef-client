@@ -2,7 +2,8 @@
 
 Components: ``client`` (the ask/observe/report loop), ``skill`` (fetch and
 sync the served skill file), ``sse`` (stream synthesis/accumulation), and
-``serve`` (a local sidecar agents treat as their model endpoint).
+``serve`` (a local sidecar agents treat as their model endpoint), and
+``record_import`` (resumable uploads of existing records).
 Everything is standard library only, so external harnesses can copy or
 import the package with no dependency on the ``reef`` package.
 
