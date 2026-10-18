@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import urlsplit
 
+#: Reef's record import routes refuse a larger request body (1 MiB before Reef PR #846).
+MAX_REQUEST_BYTES = 10 * 1024 * 1024
+
 
 def record_batches(
     source: BinaryIO, *, batch_size: int, max_bytes: int
@@ -153,11 +156,11 @@ def import_records_file(
         raise ValueError("scenario must not be empty")
     if (
         not 1 <= batch_size <= 1000
-        or not 128 <= max_batch_bytes < 1024 * 1024
+        or not 128 <= max_batch_bytes < MAX_REQUEST_BYTES
         or max_retries < 0
     ):
         raise ValueError(
-            "require batch-size 1..1000, max-batch-bytes 128..1048575 and nonnegative retries"
+            f"require batch-size 1..1000, max-batch-bytes 128..{MAX_REQUEST_BYTES - 1} and nonnegative retries"
         )
     source_path = source_path.resolve()
     progress_path = (

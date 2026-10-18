@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from reef_client.record_import import import_records_file, record_batches
+from reef_client.record_import import (
+    MAX_REQUEST_BYTES,
+    import_records_file,
+    record_batches,
+)
 
 
 def imported(record_id, payload=None):
@@ -68,6 +72,30 @@ def test_import_rejects_concurrent_checkpoint_use(tmp_path):
                 url="http://localhost:8900",
                 scenario="s",
                 progress_path=progress,
+            )
+
+
+def test_import_takes_batches_up_to_the_reef_request_limit(tmp_path):
+    source = tmp_path / "records.jsonl"
+    write_records(source, 1)
+    with pytest.raises(ValueError, match="max-batch-bytes"):
+        import_records_file(
+            source,
+            url="http://localhost:8900",
+            scenario="s",
+            max_batch_bytes=MAX_REQUEST_BYTES,
+        )
+    progress = tmp_path / "progress.json"
+    with progress.with_name(progress.name + ".lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # The held lock stops the import after the batch limit check passes.
+        with pytest.raises(ValueError, match="another importer"):
+            import_records_file(
+                source,
+                url="http://localhost:8900",
+                scenario="s",
+                progress_path=progress,
+                max_batch_bytes=MAX_REQUEST_BYTES - 1,
             )
 
 
