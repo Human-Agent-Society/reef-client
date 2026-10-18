@@ -72,8 +72,9 @@ it needs. The importer preserves IDs and payloads; it does not run inference or
 convert arbitrary dataset schemas.
 
 - Reads incrementally, limiting each request by `--batch-size` (default 128)
-  and `--max-batch-bytes` (default 524288). Requests must stay below 1 MiB and
-  contain at most 1000 records. Each source line must fit the byte limit.
+  and `--max-batch-bytes` (default 524288). Requests must stay below 10 MiB and
+  contain at most 1000 records. Each source line must fit the byte limit. A Reef
+  service older than Reef PR #846 accepts requests below 1 MiB only.
 - Reuses the HTTP connection and retries transient failures with backoff
   (`--retries`, default 3). It sends unchanged record IDs on retry.
 - Saves acknowledged byte offsets to `FILE.reef-import.json`, or `--progress PATH`.
