@@ -2,8 +2,7 @@
 
     reef-client harness connect SCENARIO --reef URL --adapter pi
     reef-client harness run SCENARIO [-- pi ...]
-    reef-client harness pull SCENARIO [--force]
-    reef-client harness push SCENARIO
+    reef-client harness sync SCENARIO [--discard]
     reef-client harness status SCENARIO
 
 ``connect`` reads the harness where the agent keeps it (``~/.pi/agent``, or
@@ -13,12 +12,14 @@ owns, bound to Reef: the agent sends its model calls to Reef, which records
 them as the scenario's traffic. The person's own directory is read and never
 written.
 
-``run`` installs a newer release when the installed files are unchanged, then
-runs the agent with its root variables at the install, so every session starts
-on the newest release. ``pull`` installs the head and refuses to drop changed
-files unless forced. ``push`` publishes the changed files as a new release and
-installs it. ``status`` shows the installed release, the head, and the files
-changed since the install.
+``sync`` sends the files changed since the install, such as a note the agent
+wrote to its memory, and installs the head. Reef merges the changes onto its
+head file by file, so a release that Reef made in the meantime is kept; a file
+that both sides changed is refused by name. ``--discard`` drops the changes
+and installs the head. ``run`` syncs, runs the agent with its root variables
+at the install, and syncs again when the agent exits: every session starts on
+the newest release, and what the session changed reaches Reef before its next
+step. ``status`` shows the installed release, the head, and the changed files.
 
 The client knows no adapter: ``GET /reef/harness/adapters`` says where each
 root lives and which files are the harness's. The token comes from
@@ -32,6 +33,8 @@ import hashlib
 import json
 import os
 import re
+import signal
+import subprocess
 import sys
 import urllib.parse
 from collections.abc import Mapping, Sequence
@@ -161,13 +164,16 @@ class HarnessInstall:
     # -- the routes ------------------------------------------------------------------------------------------------
 
     def head(self) -> dict[str, Any]:
-        """The head release rendered for this install: model calls bound to this Reef's route of the scenario."""
-        query = urllib.parse.urlencode({"form": "client", "service_url": self.record["reef_url"]})
+        """The head release rendered for this install: model calls bound to this Reef's route of the scenario, and
+        paths under the install directory."""
+        query = urllib.parse.urlencode(
+            {"form": "client", "service_url": self.record["reef_url"], "root": str(self.directory.resolve())}
+        )
         return self.client.get(f"/reef/harness?{query}", extra_headers={"x-reef-scenario": self.record["scenario"]})
 
     def import_files(self, files: Mapping[str, str], base_release_id: str | None) -> dict[str, Any]:
         """``POST /reef/harness/import``; HarnessSyncError for a refusal the person resolves: a file that fails
-        Reef's checks (HTTP 400), or a head the install is not on (HTTP 409)."""
+        Reef's checks (HTTP 400), a file that the head changed too, or a step that is running (HTTP 409)."""
         try:
             answer, _ = self.client.post(
                 "/reef/harness/import",
@@ -219,28 +225,28 @@ class HarnessInstall:
         lines.append(f"run your agent with: reef-client harness run {self.record['scenario']}")
         return "\n".join(lines)
 
-    def pull(self, *, force: bool = False) -> str:
-        manifest = self.head()
-        if manifest["release_id"] == self.record["release_id"]:
-            return f"release {manifest['release_id']} is installed and is the head"
-        changed = self.changed()
-        if changed and not force:
-            raise HarnessSyncError(
-                f"files changed since release {self.record['release_id']}: {', '.join(changed)}. "
-                f"Push them with reef-client harness push {self.record['scenario']}, or drop them with pull --force"
-            )
-        previous = self.record["release_id"]
-        self.install(manifest)
-        return "\n".join([f"installed release {manifest['release_id']} (was {previous})", *required(manifest)])
+    def sync(self, *, discard: bool = False) -> str:
+        """Send the changed files, then install the head; a report.
 
-    def push(self) -> str:
-        changed = self.changed()
-        if not changed:
-            return f"nothing changed since release {self.record['release_id']}"
-        answer = self.import_files(read_tree(self.install_roots(), self.pattern), self.record["release_id"])
-        # The release reads back in the form Reef renders it, so the install is the release again.
-        self.install(self.head())
-        return f"published {', '.join(changed)} as release {answer['release_id']}, and installed it"
+        Reef merges the changes onto its head, so the head after the import holds them. HarnessSyncError when Reef
+        refuses them; the changed files then stay as they are. ``discard`` sends nothing and installs the head
+        over the changes.
+        """
+        previous = self.record["release_id"]
+        changed = [] if discard else self.changed()
+        lines = []
+        if changed:
+            answer = self.import_files(read_tree(self.install_roots(), self.pattern), previous)
+            if answer["changed"]:
+                onto = f", merged onto release {answer['parent_release_id']}" if answer["merged"] else ""
+                lines.append(f"sent {', '.join(changed)} as release {answer['release_id']}{onto}")
+        manifest = self.head()
+        if manifest["release_id"] == previous and not changed and not discard:
+            return f"release {previous} is installed and is the head"
+        # The import reads back in the form Reef renders it, so the install is the release again.
+        self.install(manifest)
+        lines.append(f"installed release {manifest['release_id']} (was {previous})")
+        return "\n".join([*lines, *required(manifest)])
 
     def status(self) -> str:
         head = self.head()["release_id"]
@@ -248,24 +254,39 @@ class HarnessInstall:
         lines = [
             f"scenario {self.record['scenario']} on {self.record['reef_url']} ({self.record['adapter']})",
             f"installed release {self.record['release_id']} at {self.directory}",
-            "the head" if head == self.record["release_id"] else f"the head is release {head}: pull it",
+            "the head" if head == self.record["release_id"] else f"the head is release {head}: sync to install it",
         ]
-        lines.append(f"changed: {', '.join(changed)}" if changed else "no file changed since the install")
+        lines.append(f"changed, not sent: {', '.join(changed)}" if changed else "no file changed since the install")
         return "\n".join(lines)
 
-    def run(self, command: Sequence[str]) -> None:
-        """Pull a newer release when nothing changed, then replace this process with ``command`` on the install."""
+    def try_sync(self) -> None:
+        """``sync``, telling the person on stderr why a sync that could not finish keeps the files as they are."""
         try:
-            print(self.pull(), file=sys.stderr)
+            print(self.sync(), file=sys.stderr)
         except HarnessSyncError as exc:
-            print(f"kept release {self.record['release_id']}: {exc}", file=sys.stderr)
+            print(f"kept your files on release {self.record['release_id']}: {exc}", file=sys.stderr)
         except (ReefClientError, OSError) as exc:
-            print(f"kept release {self.record['release_id']}: Reef did not answer ({exc})", file=sys.stderr)
+            kept = self.record["release_id"]
+            print(f"kept your files on release {kept}: Reef did not answer ({exc})", file=sys.stderr)
+
+    def run(self, command: Sequence[str]) -> int:
+        """Sync, run ``command`` on the install, and sync again when it exits; the command's exit status.
+
+        A sync that cannot finish keeps the files, and the agent runs on them. While the agent runs, this process
+        ignores Ctrl-C, which the agent handles, so the sync after it still runs.
+        """
+        self.try_sync()
         environment = dict(os.environ)
         for name, root in self.record["roots"].items():
             environment[root["variable"]] = str(self.directory / name)
         argv = list(command) or [self.record["binary"]]
-        os.execvpe(argv[0], argv, environment)
+        interrupt = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            status = subprocess.run(argv, env=environment, check=False).returncode
+        finally:
+            signal.signal(signal.SIGINT, interrupt)
+        self.try_sync()
+        return status
 
 
 def split_command(argv: list[str]) -> tuple[list[str], bool, list[str]]:
@@ -285,15 +306,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     connect.add_argument("--reef", required=True, help="the Reef URL, such as http://127.0.0.1:8900")
     connect.add_argument("--adapter", required=True, help="the agent: pi, claude, codex or opencode")
     for name, help in (
-        ("run", "run the agent on the newest release; a command after -- replaces the agent's own"),
-        ("pull", "install the head"),
-        ("push", "publish the changed files as a release"),
+        ("run", "sync, run the agent, and sync again when it exits; a command after -- replaces the agent's own"),
+        ("sync", "send the changed files and install the head"),
         ("status", "show the installed release, the head and the changed files"),
     ):
         command = commands.add_parser(name, help=help)
         command.add_argument("scenario")
-        if name == "pull":
-            command.add_argument("--force", action="store_true", help="drop the changed files")
+        if name == "sync":
+            command.add_argument("--discard", action="store_true", help="drop the changed files and install the head")
     for command in commands.choices.values():
         command.add_argument("--dir", type=Path, help="the install directory")
     arguments = parser.parse_args(arguments_before)
@@ -309,11 +329,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             return
         install = HarnessInstall.open(directory, token)
         if arguments.command == "run":
-            install.run(agent)
-        elif arguments.command == "pull":
-            print(install.pull(force=arguments.force))
-        elif arguments.command == "push":
-            print(install.push())
+            raise SystemExit(install.run(agent))
+        if arguments.command == "sync":
+            print(install.sync(discard=arguments.discard))
         else:
             print(install.status())
     except HarnessSyncError as exc:
