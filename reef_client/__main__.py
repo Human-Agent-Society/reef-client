@@ -14,11 +14,17 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         import_main(arguments[1:])
         return
+    if arguments and arguments[0] == "harness":
+        from reef_client.harness import main as harness_main
+
+        harness_main(arguments[1:])
+        return
     parser = argparse.ArgumentParser(prog="reef-client", description=__doc__)
     parser.add_argument(
         "command",
-        choices=("import",),
-        help="import a records JSONL file with resumable batch uploads",
+        choices=("import", "harness"),
+        help="import: upload a records JSONL file with resumable batches; "
+        "harness: sync an agent's harness with Reef and run the agent on its release",
     )
     parser.parse_args(arguments)
 
