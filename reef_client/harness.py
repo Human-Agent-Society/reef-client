@@ -10,20 +10,20 @@
 when Reef serves more than one, and the token, when Reef refuses the call
 without one (else ``REEF_TOKEN``); the Reef URL is ``--reef`` or
 ``REEF_URL``. It installs the harness's head in a directory that this client
-owns, as the adapter's layer: the agent loads the person's own configuration
-as it always does, and the release over it, with its model calls going to
-Reef. This client never reads or writes the person's own configuration. An
-agent that loads a part from no path a flag names gets the install through
-its own commands, which the release names (``register``): Codex's ``plugin``
-commands add the install's skills as a plugin to the person's ``~/.codex``.
-``connect`` and each ``run`` run them once per installed release, while no
-other session runs on the install, and ``disconnect`` undoes them. It installs
+owns. The release there is a plugin of the agent, and the agent's own
+commands, which the release names (``register``), install it, such as
+``claude plugin install`` or ``pi install``: the agent then loads it in every
+session, beside the person's own configuration, which this client never
+reads or writes. ``connect`` and each ``run`` run those commands once per
+installed release, while no other session runs on the install, and
+``disconnect`` undoes them (``unregister``). ``connect`` first undoes them
+for the install that the agent's command ran before. It installs
 the agent, at the version Reef evaluates with, when the machine lacks it, and
 makes the agent's own command, such as ``claude``, run through Reef: a command
 of that name in this client's ``bin`` directory, put ahead on ``PATH`` in the
-shell's startup file. ``run`` syncs, runs the
-agent with the layer's arguments and variables, and when the agent exits sends
-what the session changed in the layer, such as Claude Code's memory, from a
+shell's startup file. A session that it starts sends its model calls to Reef.
+``run`` syncs, runs the agent with the layer's arguments and variables, and
+when the agent exits sends what the session changed in the release, from a
 process of its own: the terminal is back at once. Reef refuses the send while a
 step runs, and the change then waits for the next ``run`` or ``sync``. ``sync`` sends the files changed since the install and
 installs the head; Reef merges the changes onto its head as each part's
@@ -422,12 +422,14 @@ class HarnessInstall:
         self.save()
 
     def unregister(self) -> list[str]:
-        """Run the agent's ``unregister`` commands, each even when one before it failed; a line per command that
-        did not finish, with the command for the person to run."""
+        """Run the agent's ``unregister`` commands, each even when one before it failed, and record that no release
+        is registered; a line per command that did not finish, with the command for the person to run."""
         if self.record.get("registered") is None:
             return []
         commands = self.record["run"].get("unregister") or []
         binary = self.record["run"]["binary"]
+        self.record["registered"] = None
+        self.save()
         try:
             agent = self.agent()
         except HarnessSyncError:
@@ -619,9 +621,13 @@ def connect(scenario: str | None, reef_url: str | None, directory: Path | None) 
         agent = install_agent(binary, pinned)
     install.record["agent"] = agent
     install.save()
+    # The agent loads every release it has installed, so the one its command ran before leaves first.
+    before = command_scenario(commands_root() / binary)
+    lines = required(manifest)
+    if before not in (None, scenario) and (installs_root() / before / INSTALL_FILE).is_file():
+        lines.extend(HarnessInstall.open(installs_root() / before).unregister())
     install.register()
     previous, profile = route_through_reef(binary, scenario, install.directory)
-    lines = required(manifest)
     if previous not in (None, scenario):
         lines.append(f"{binary} now runs {scenario} instead of {previous}")
     if profile is None:
