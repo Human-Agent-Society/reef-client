@@ -95,6 +95,33 @@ def test_a_sync_writes_no_file_for_the_files_it_sent_and_none_under_a_session(tm
     assert rules.read_text() == "Briefer, always.\n"
 
 
+def test_the_agents_register_commands_run_once_per_release_until_disconnect_undoes_them(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    log = tmp_path / "codex.log"
+    agent = tmp_path / "codex"
+    agent.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\n[ "$1" != fail ]\n')
+    agent.chmod(0o755)
+    run = {"binary": "codex", "args": [], "env": {}, "register": [["plugin", "add", "reef@reef"]]}
+    run["unregister"] = [["plugin", "remove", "reef@reef"]]
+    install = HarnessInstall.create(tmp_path / "s", "http://reef.invalid", "s", token=None)
+    install.install({"release_id": "r1", "files": {}, "run": run, "synced": []})
+    install.record["agent"] = str(agent)
+    install.register()
+    install.register()
+    install.install({"release_id": "r2", "files": {}, "run": run, "synced": []})
+    install.register()
+    assert log.read_text() == "plugin add reef@reef\n" * 2
+    # A command that fails names itself, and the next run tries the release again.
+    install.install({"release_id": "r3", "files": {}, "run": {**run, "register": [["fail"]]}, "synced": []})
+    with pytest.raises(HarnessSyncError, match="codex fail failed"):
+        install.register()
+    assert install.record["registered"] == "r2"
+    assert install.disconnect() == "removed the install of s; your own configuration is as it was"
+    assert log.read_text().endswith("fail\nplugin remove reef@reef\n")
+
+
 def test_a_command_without_a_scenario_means_the_only_install(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     with pytest.raises(HarnessSyncError, match="none is installed"):

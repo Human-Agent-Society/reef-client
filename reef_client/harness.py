@@ -12,7 +12,12 @@ without one (else ``REEF_TOKEN``); the Reef URL is ``--reef`` or
 ``REEF_URL``. It installs the harness's head in a directory that this client
 owns, as the adapter's layer: the agent loads the person's own configuration
 as it always does, and the release over it, with its model calls going to
-Reef. The person's own configuration is never read or written. It installs
+Reef. This client never reads or writes the person's own configuration. An
+agent that loads a part from no path a flag names gets the install through
+its own commands, which the release names (``register``): Codex's ``plugin``
+commands add the install's skills as a plugin to the person's ``~/.codex``.
+``connect`` and each ``run`` run them once per installed release, while no
+other session runs on the install, and ``disconnect`` undoes them. It installs
 the agent, at the version Reef evaluates with, when the machine lacks it, and
 makes the agent's own command, such as ``claude``, run through Reef: a command
 of that name in this client's ``bin`` directory, put ahead on ``PATH`` in the
@@ -283,9 +288,11 @@ class HarnessInstall:
     Values: ``directory`` holds the installed files at their render paths and
     ``INSTALL_FILE``, the record: the Reef URL, the scenario, the token, the
     installed release, the digest of each installed file, the command that
-    runs the agent (``run``), the templates of the files that sync
-    (``synced``) and, once ``connect`` found it, the agent's own executable
-    (``agent``). The directory also holds ``SESSION_LOCK``, ``SYNC_LOCK`` and
+    runs the agent and the agent's commands that record and remove the
+    install (``run``), the templates of the files that sync (``synced``),
+    once ``connect`` found it, the agent's own executable (``agent``), and
+    the release whose files the agent's ``register`` commands last recorded
+    (``registered``). The directory also holds ``SESSION_LOCK``, ``SYNC_LOCK`` and
     ``SYNC_LOG``. ``client`` reaches the Reef the record names.
     Purpose: ``connect`` makes one (``create``); the other commands read it
     back (``open``).
@@ -388,6 +395,51 @@ class HarnessInstall:
         record.write_text(json.dumps(self.record, indent=2) + "\n", encoding="utf-8")
         record.chmod(0o600)
 
+    def agent(self) -> str:
+        """The agent's own executable, never this client's command of the same name, which would run Reef again;
+        HarnessSyncError when the machine has none."""
+        agent = self.record.get("agent")
+        if agent is None or not Path(agent).is_file():
+            agent = find_agent(self.record["run"]["binary"])
+        if agent is None:
+            raise HarnessSyncError(f"{self.record['run']['binary']} is not installed: connect again to install it")
+        return agent
+
+    def register(self) -> None:
+        """Run the agent's ``register`` commands on the installed release, once per release, so the agent loads
+        what it reads from no path a flag names; HarnessSyncError naming a command that failed."""
+        commands = self.record["run"].get("register") or []
+        if not commands or self.record.get("registered") == self.record["release_id"]:
+            return
+        agent = self.agent()
+        for command in commands:
+            done = subprocess.run([agent, *command], capture_output=True, text=True, check=False)
+            if done.returncode != 0:
+                raise HarnessSyncError(
+                    f"{self.record['run']['binary']} {shlex.join(command)} failed: {done.stderr.strip()[-400:]}"
+                )
+        self.record["registered"] = self.record["release_id"]
+        self.save()
+
+    def unregister(self) -> list[str]:
+        """Run the agent's ``unregister`` commands, each even when one before it failed; a line per command that
+        did not finish, with the command for the person to run."""
+        if self.record.get("registered") is None:
+            return []
+        commands = self.record["run"].get("unregister") or []
+        binary = self.record["run"]["binary"]
+        try:
+            agent = self.agent()
+        except HarnessSyncError:
+            return [
+                f"{binary} is not installed; once it is, run {binary} {shlex.join(command)}" for command in commands
+            ]
+        return [
+            f"{binary} {shlex.join(command)} did not finish; run it yourself if it is needed"
+            for command in commands
+            if subprocess.run([agent, *command], capture_output=True, check=False).returncode != 0
+        ]
+
     def connect(self) -> dict[str, Any]:
         """Create the scenario when it is new and install its head; the head's manifest."""
         self.client.post("/reef/scenarios", self.record["scenario"], {"name": self.record["scenario"]})
@@ -444,9 +496,10 @@ class HarnessInstall:
         changed = self.changed()
         if changed and not discard:
             raise HarnessSyncError(f"not sent yet: {', '.join(changed)}. Sync them, or disconnect with --discard")
+        unfinished = self.unregister()
         shutil.rmtree(self.directory)
         scenario = self.record["scenario"]
-        lines = [f"removed the install of {scenario}; your own configuration is as it was"]
+        lines = [f"removed the install of {scenario}; your own configuration is as it was", *unfinished]
         binary = (self.record.get("run") or {}).get("binary")
         if binary and unroute(binary, scenario):
             lines.append(f"{binary} runs on its own again in a new terminal")
@@ -487,12 +540,14 @@ class HarnessInstall:
                     file=sys.stderr,
                 )
         command = self.record["run"]
-        # The agent's own executable, never this client's command of the same name, which would run Reef again.
-        agent = self.record.get("agent")
-        if agent is None or not Path(agent).is_file():
-            agent = find_agent(command["binary"])
-        if agent is None:
-            raise HarnessSyncError(f"{command['binary']} is not installed: connect again to install it")
+        agent = self.agent()
+        # The agent's register commands change what its other sessions read too, so they wait for none to run.
+        with locked(self.directory / SESSION_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB) as alone:
+            if alone:
+                try:
+                    self.register()
+                except HarnessSyncError as exc:
+                    print(f"{exc}; the agent starts without what those commands load", file=sys.stderr)
         key = self.record.get("token") or NO_TOKEN_KEY
         layer_env = {name: value.replace(TOKEN_PLACEHOLDER, key) for name, value in command["env"].items()}
         interrupt = signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -564,6 +619,7 @@ def connect(scenario: str | None, reef_url: str | None, directory: Path | None) 
         agent = install_agent(binary, pinned)
     install.record["agent"] = agent
     install.save()
+    install.register()
     previous, profile = route_through_reef(binary, scenario, install.directory)
     lines = required(manifest)
     if previous not in (None, scenario):
