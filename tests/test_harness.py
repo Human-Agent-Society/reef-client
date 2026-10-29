@@ -1,9 +1,11 @@
-"""The harness sync's local half: which files sync, what an install writes and records, and which install a
-command means."""
+"""The harness sync's local half: which files sync, what an install writes and records, which install a command
+means, and how connect installs the agent and routes its command through Reef."""
 
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
 
 import pytest
@@ -13,10 +15,15 @@ from reef_client.harness import (
     TOKEN_PLACEHOLDER,
     HarnessInstall,
     HarnessSyncError,
+    commands_root,
     file_pattern,
+    find_agent,
+    install_agent,
     install_directory,
     read_tree,
+    route_through_reef,
     split_command,
+    unroute,
 )
 
 SYNCED = ["claude/CLAUDE.md", "claude/skills/{name}/SKILL.md", "claude/memory/{name}.md"]
@@ -78,3 +85,50 @@ def test_a_command_without_a_scenario_means_the_only_install(tmp_path: Path, mon
 def test_the_arguments_after_the_separator_are_the_agents() -> None:
     assert split_command(["run", "s", "--", "--resume", "--", "x"]) == (["run", "s"], ["--resume", "--", "x"])
     assert split_command(["status"]) == (["status"], [])
+
+
+def test_the_agent_command_runs_through_reef_until_disconnect(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    monkeypatch.delenv("ZDOTDIR", raising=False)
+    profile = tmp_path / "home" / ".zshrc"
+    profile.parent.mkdir()
+    profile.write_text("export EDITOR=vim\n")
+    real = tmp_path / "vendor"
+    real.mkdir()
+    (real / "claude").write_text("#!/bin/sh\n")
+    (real / "claude").chmod(0o755)
+    assert route_through_reef("claude", "code-repair", tmp_path / "install") == (None, profile)
+    assert route_through_reef("claude", "code-repair", tmp_path / "install") == ("code-repair", profile)
+    command = commands_root() / "claude"
+    assert "harness run code-repair --dir" in command.read_text() and command.stat().st_mode & 0o111
+    # The startup file gains one block, ahead on PATH, however often connect runs.
+    assert profile.read_text().count("reef-client/bin") == 1 and profile.read_text().startswith("export EDITOR")
+    # The client's own command never stands in for the agent it runs.
+    monkeypatch.setenv("PATH", f"{commands_root()}{os.pathsep}{real}")
+    assert find_agent("claude") == str(real / "claude")
+    assert not unroute("claude", "another") and command.exists()
+    assert unroute("claude", "code-repair") and not commands_root().exists()
+    assert profile.read_text() == "export EDITOR=vim\n"
+
+
+def test_a_missing_agent_installs_its_pinned_npm_package(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    pinned = {"kind": "npm", "package": "@acme/agent", "version": "1.2.3", "binary_path": "node_modules/.bin/agent"}
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    with pytest.raises(HarnessSyncError, match=re.escape("needs npm: install Node.js, or @acme/agent@1.2.3")):
+        install_agent("agent", pinned)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # A stand-in npm: it records its arguments and makes the binary under the prefix it was given.
+    (bin_dir / "npm").write_text(
+        '#!/bin/sh\necho "$@" > "$3/args"\nmkdir -p "$3/node_modules/.bin" && touch "$3/node_modules/.bin/agent"\n'
+    )
+    (bin_dir / "npm").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin")
+    executable = install_agent("agent", pinned)
+    prefix = tmp_path / "data" / "reef-client" / "agents" / "agent"
+    assert executable == str(prefix / "node_modules" / ".bin" / "agent")
+    arguments = ["install", "--prefix", str(prefix), "--no-fund", "--no-audit", "@acme/agent@1.2.3"]
+    assert (prefix / "args").read_text().split() == arguments

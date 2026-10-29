@@ -14,9 +14,13 @@ import package is the inner [`reef_client/`](reef_client) directory:
 - [`harness.py`](reef_client/harness.py) syncs an agent's harness with Reef
   (`reef-client harness connect|run|sync|status|disconnect`): it runs the
   agent with the release Reef serves as a layer over the person's own
-  configuration, which it never writes. Each run syncs before the agent
-  starts and after it exits, so what a session changes in the layer, such as
-  Claude Code's memory, reaches Reef before its next step.
+  configuration, which it never writes. `reef-client harness connect` sets a
+  machine up in one command: it asks only for what it cannot find (the Reef
+  URL, the token, the scenario), offers to install the agent when it is
+  missing, and offers to make the agent's own command, such as `claude`, run
+  through Reef. Each run syncs before the agent starts and after it exits, so
+  what a session changes in the layer, such as Claude Code's memory, reaches
+  Reef before its next step.
 - [`skill.py`](reef_client/skill.py) fetches and syncs the scenario's served
   skill file (`fetch_skill`/`sync_skill`);
 - [`sse.py`](reef_client/sse.py) converts between buffered chat completions

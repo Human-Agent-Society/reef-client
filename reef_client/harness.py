@@ -1,22 +1,30 @@
 """Run an agent on the harness Reef evolves, over the person's own configuration, and keep the two in sync.
 
-    reef-client harness connect SCENARIO --reef URL
+    reef-client harness connect [SCENARIO] [--reef URL] [--yes]
     reef-client harness run [SCENARIO] [-- AGENT ARGS]
     reef-client harness sync [SCENARIO] [--discard]
     reef-client harness status [SCENARIO]
     reef-client harness disconnect [SCENARIO] [--discard]
 
-``connect`` installs the scenario's head in a directory that this client owns,
-as the adapter's layer: the agent loads the person's own configuration as it
-always does, and the release over it, with its model calls going to Reef. The
-person's own configuration is never read or written. ``run`` syncs, runs the
+``connect`` sets a machine up in one command, and asks only for what it
+cannot find: the Reef URL (``--reef`` or ``REEF_URL``), the token
+(``REEF_TOKEN``, asked for when Reef refuses the call without one) and the
+scenario (chosen from Reef's list, or a new name). It installs the scenario's
+head in a directory that this client owns, as the adapter's layer: the agent
+loads the person's own configuration as it always does, and the release over
+it, with its model calls going to Reef. The person's own configuration is
+never read or written. When the agent is not installed, ``connect`` offers to
+install the version Reef evaluates with. Then it offers to make the agent's
+own command, such as ``claude``, run through Reef: a command of that name in
+this client's ``bin`` directory, put ahead on ``PATH`` in the shell's startup
+file. ``--yes`` accepts both offers without asking. ``run`` syncs, runs the
 agent with the layer's arguments and variables, and syncs again when the agent
 exits, so every session starts on the newest release and what the session
 changed in the layer, such as Claude Code's memory, reaches Reef before its
 next step. ``sync`` sends the files changed since the install and installs the
 head; Reef merges the changes onto its head as each part's ``merge`` says.
 ``--discard`` drops the changes instead. ``status`` shows where the install
-stands, and ``disconnect`` removes it.
+stands, and ``disconnect`` removes it and the agent command it added.
 
 The client knows no adapter: the head, in the client form, carries the files,
 the command and the templates of the files that sync. The token comes from
@@ -26,10 +34,12 @@ the command and the templates of the files that sync. The token comes from
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -49,16 +59,35 @@ TOKEN_PLACEHOLDER = "REEF_TOKEN_PLACEHOLDER"
 NO_TOKEN_KEY = "reef"
 #: Seconds a sync around a run waits for Reef, so a Reef that does not answer delays a session little.
 RUN_SYNC_TIMEOUT_S = 15.0
+#: The lines around what ``connect`` adds to the shell's startup file, so ``disconnect`` finds it again.
+PROFILE_BLOCK = ("# >>> reef-client >>>", "# <<< reef-client <<<")
+#: The line of an agent command that names the scenario it runs.
+COMMAND_SCENARIO = re.compile(r"^# reef-client scenario: (.+)$", re.M)
 
 
 class HarnessSyncError(RuntimeError):
     """A sync that cannot go on, with what the person should do next."""
 
 
-def installs_root() -> Path:
-    """Where this client keeps its installs: ``$XDG_DATA_HOME/reef-client/harness``."""
+def data_root() -> Path:
+    """Where this client keeps its files: ``$XDG_DATA_HOME/reef-client``."""
     data_home = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-    return Path(data_home) / "reef-client" / "harness"
+    return Path(data_home) / "reef-client"
+
+
+def installs_root() -> Path:
+    """Where this client keeps its installs: ``data_root()/harness``."""
+    return data_root() / "harness"
+
+
+def commands_root() -> Path:
+    """Where this client keeps the agent commands that run through Reef: ``data_root()/bin``, ahead on ``PATH``."""
+    return data_root() / "bin"
+
+
+def agents_root() -> Path:
+    """Where this client installs an agent that the machine lacks: ``data_root()/agents/<binary>``."""
+    return data_root() / "agents"
 
 
 def install_directory(scenario: str | None) -> Path:
@@ -104,14 +133,146 @@ def read_tree(directory: Path, pattern: re.Pattern[str]) -> dict[str, str]:
     return files
 
 
+def confirm(question: str, *, assume_yes: bool) -> bool:
+    """The person's answer to ``question``, yes by default; without a terminal to ask in, yes only when
+    ``assume_yes``."""
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    return input(f"{question} [Y/n] ").strip().lower() in ("", "y", "yes")
+
+
+def ask(question: str, *, secret: bool = False) -> str:
+    """The person's typed answer to ``question``; HarnessSyncError without a terminal to ask in."""
+    if not sys.stdin.isatty():
+        raise HarnessSyncError(f"{question} (no terminal to ask in: pass it as an option or a variable)")
+    return (getpass.getpass(f"{question} ") if secret else input(f"{question} ")).strip()
+
+
+def find_agent(binary: str) -> str | None:
+    """The agent's own executable on ``PATH``, skipping this client's agent commands, which would run Reef again."""
+    commands = commands_root().resolve()
+    entries = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry]
+    return shutil.which(binary, path=os.pathsep.join(entry for entry in entries if Path(entry).resolve() != commands))
+
+
+def install_agent(binary: str, install: Mapping[str, Any]) -> str:
+    """Install ``install``, the agent's pinned vendor install, under ``agents_root()``; the installed executable.
+
+    HarnessSyncError when the install is not an npm package, npm is missing, or npm fails.
+    """
+    package = f"{install.get('package')}@{install.get('version')}"
+    if install.get("kind") != "npm":
+        raise HarnessSyncError(f"{binary} is not installed: install {package} yourself, then connect again")
+    npm = shutil.which("npm")
+    if npm is None:
+        raise HarnessSyncError(
+            f"{binary} is not installed, and installing it needs npm: install Node.js, or {package}"
+        )
+    prefix = agents_root() / binary
+    prefix.mkdir(parents=True, exist_ok=True)
+    done = subprocess.run([npm, "install", "--prefix", str(prefix), "--no-fund", "--no-audit", package], check=False)
+    executable = prefix / str(install.get("binary_path"))
+    if done.returncode != 0 or not executable.is_file():
+        raise HarnessSyncError(f"npm could not install {package} under {prefix}")
+    return str(executable)
+
+
+def installed_agent(binary: str, install: Mapping[str, Any] | None) -> str | None:
+    """The executable that an earlier ``install_agent`` left for ``binary``, or ``None``."""
+    if install is None:
+        return None
+    executable = agents_root() / binary / str(install.get("binary_path"))
+    return str(executable) if executable.is_file() else None
+
+
+def shell_profile() -> Path | None:
+    """The startup file of the person's shell, by ``$SHELL``: zsh, bash or fish; ``None`` for another shell."""
+    shell = Path(os.environ.get("SHELL", "")).name
+    home = Path.home()
+    if shell == "zsh":
+        return Path(os.environ.get("ZDOTDIR") or home) / ".zshrc"
+    if shell == "bash":
+        # macOS terminals start login shells, which read .bash_profile instead of .bashrc.
+        return home / (".bash_profile" if sys.platform == "darwin" else ".bashrc")
+    if shell == "fish":
+        return home / ".config" / "fish" / "config.fish"
+    return None
+
+
+def path_line(profile: Path) -> str:
+    """The line of ``profile`` that puts ``commands_root()`` ahead on ``PATH``."""
+    if profile.name == "config.fish":
+        return f"fish_add_path --prepend {shlex.quote(str(commands_root()))}"
+    return f'export PATH={shlex.quote(str(commands_root()))}:"$PATH"'
+
+
+def command_scenario(command: Path) -> str | None:
+    """The scenario an agent command of this client runs, or ``None`` when ``command`` is not one."""
+    if not command.is_file():
+        return None
+    match = COMMAND_SCENARIO.search(command.read_text(encoding="utf-8", errors="replace"))
+    return None if match is None else match.group(1)
+
+
+def route_through_reef(binary: str, scenario: str, directory: Path) -> tuple[str | None, Path | None]:
+    """Make ``binary`` run through Reef's ``scenario``, installed at ``directory``: an agent command of that name in
+    ``commands_root()``, and ``commands_root()`` ahead on ``PATH`` in the shell's startup file.
+
+    Returns the scenario the command ran before, if any, and the startup file, ``None`` when the shell is not one
+    this client knows.
+    """
+    command = commands_root() / binary
+    previous = command_scenario(command)
+    command.parent.mkdir(parents=True, exist_ok=True)
+    command.write_text(
+        "#!/bin/sh\n"
+        f"# reef-client scenario: {scenario}\n"
+        f"# Runs {binary} through Reef. Undo with: reef-client harness disconnect {scenario}\n"
+        f"exec {shlex.quote(sys.executable)} -m reef_client harness run {shlex.quote(scenario)}"
+        f' --dir {shlex.quote(str(directory.resolve()))} -- "$@"\n',
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+    profile = shell_profile()
+    if profile is not None:
+        text = profile.read_text(encoding="utf-8") if profile.is_file() else ""
+        if PROFILE_BLOCK[0] not in text:
+            block = "\n".join([PROFILE_BLOCK[0], path_line(profile), PROFILE_BLOCK[1]])
+            profile.parent.mkdir(parents=True, exist_ok=True)
+            profile.write_text(f"{text.rstrip()}\n\n{block}\n" if text.strip() else f"{block}\n", encoding="utf-8")
+    return previous, profile
+
+
+def unroute(binary: str, scenario: str) -> bool:
+    """Remove the agent command ``binary`` when it runs ``scenario``, and the startup file's block once no command
+    is left; whether a command was removed."""
+    command = commands_root() / binary
+    if command_scenario(command) != scenario:
+        return False
+    command.unlink()
+    if not any(commands_root().iterdir()):
+        commands_root().rmdir()
+        profile = shell_profile()
+        if profile is not None and profile.is_file():
+            text = profile.read_text(encoding="utf-8")
+            start, end = text.find(PROFILE_BLOCK[0]), text.find(PROFILE_BLOCK[1])
+            if 0 <= start < end:
+                kept = text[:start].rstrip("\n") + text[end + len(PROFILE_BLOCK[1]) :]
+                profile.write_text(kept.rstrip("\n") + "\n" if kept.strip() else "", encoding="utf-8")
+    return True
+
+
 class HarnessInstall:
     """One scenario's harness installed on this machine as a layer, and the Reef it syncs with.
 
     Values: ``directory`` holds the installed files at their render paths and
     ``INSTALL_FILE``, the record: the Reef URL, the scenario, the token, the
     installed release, the digest of each installed file, the command that
-    runs the agent (``run``) and the templates of the files that sync
-    (``synced``). ``client`` reaches the Reef the record names.
+    runs the agent (``run``), the templates of the files that sync
+    (``synced``) and, once ``connect`` found it, the agent's own executable
+    (``agent``). ``client`` reaches the Reef the record names.
     Purpose: ``connect`` makes one (``create``); the other commands read it
     back (``open``).
     """
@@ -186,24 +347,21 @@ class HarnessInstall:
             run=manifest["run"],
             synced=manifest["synced"],
         )
+        self.save()
+
+    def save(self) -> None:
+        """Write the record, readable by this user alone: it holds the token."""
         record = self.directory / INSTALL_FILE
         record.write_text(json.dumps(self.record, indent=2) + "\n", encoding="utf-8")
         record.chmod(0o600)
 
     def connect(self) -> str:
-        """Create the scenario when it is new and install its head; a report with the command to run."""
+        """Create the scenario when it is new and install its head; a report of the install."""
         self.client.post("/reef/scenarios", self.record["scenario"], {"name": self.record["scenario"]})
         manifest = self.head()
         self.install(manifest)
-        scenario = self.record["scenario"]
-        return "\n".join(
-            [
-                f"installed release {manifest['release_id']} of {scenario} at {self.directory}",
-                *required(manifest),
-                f"run your agent with: reef-client harness run {scenario}",
-                f"or make it the default: alias {manifest['run']['binary']}='reef-client harness run {scenario} --'",
-            ]
-        )
+        lines = [f"installed release {manifest['release_id']} of {self.record['scenario']} at {self.directory}"]
+        return "\n".join([*lines, *required(manifest)])
 
     def sync(self, *, discard: bool = False) -> str:
         """Send the changed files, then install the head; a report.
@@ -247,7 +405,12 @@ class HarnessInstall:
         if changed and not discard:
             raise HarnessSyncError(f"not sent yet: {', '.join(changed)}. Sync them, or disconnect with --discard")
         shutil.rmtree(self.directory)
-        return f"removed the install of {self.record['scenario']}; your own configuration is as it was"
+        scenario = self.record["scenario"]
+        lines = [f"removed the install of {scenario}; your own configuration is as it was"]
+        binary = (self.record.get("run") or {}).get("binary")
+        if binary and unroute(binary, scenario):
+            lines.append(f"{binary} runs on its own again in a new terminal")
+        return "\n".join(lines)
 
     def try_sync(self) -> None:
         """``sync``, telling the person on stderr why a sync that could not finish keeps the files as they are."""
@@ -267,16 +430,82 @@ class HarnessInstall:
         """
         self.try_sync()
         command = self.record["run"]
+        # The agent's own executable, never this client's command of the same name, which would run Reef again.
+        agent = self.record.get("agent")
+        if agent is None or not Path(agent).is_file():
+            agent = find_agent(command["binary"])
+        if agent is None:
+            raise HarnessSyncError(f"{command['binary']} is not installed: connect again to install it")
         key = self.record.get("token") or NO_TOKEN_KEY
         layer_env = {name: value.replace(TOKEN_PLACEHOLDER, key) for name, value in command["env"].items()}
         interrupt = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
-            argv = [command["binary"], *command["args"], *agent_args]
+            argv = [agent, *command["args"], *agent_args]
             status = subprocess.run(argv, env={**os.environ, **layer_env}, check=False).returncode
         finally:
             signal.signal(signal.SIGINT, interrupt)
         self.try_sync()
         return status
+
+
+def choose_scenario(rows: Sequence[Mapping[str, Any]]) -> str:
+    """The scenario the person picks from Reef's ``rows`` by number, or names anew."""
+    if not sys.stdin.isatty():
+        names = ", ".join(str(row.get("scenario")) for row in rows) or "none yet"
+        raise HarnessSyncError(f"name the scenario; Reef has: {names}")
+    for number, row in enumerate(rows, start=1):
+        adapter = f" ({row['adapter']})" if row.get("adapter") else ""
+        print(f"  {number}. {row.get('scenario')}{adapter}")
+    answer = ask("Scenario: a number from the list, or a new name:" if rows else "Scenario name:")
+    if answer.isdigit() and 1 <= int(answer) <= len(rows):
+        return str(rows[int(answer) - 1]["scenario"])
+    if not answer:
+        raise HarnessSyncError("no scenario named")
+    return answer
+
+
+def connect(scenario: str | None, reef_url: str | None, directory: Path | None, *, assume_yes: bool) -> str:
+    """Set this machine up for ``scenario``: install its head as a layer, make sure the agent is installed, and make
+    the agent's own command run through Reef; a report of what it did.
+
+    It asks the person only for what it cannot find: the URL, the token when Reef refuses the call without one, the
+    scenario, and a yes to installing the agent or adding its command.
+    """
+    reef_url = reef_url or os.environ.get("REEF_URL") or ask("Reef URL, such as http://127.0.0.1:8900:")
+    token = os.environ.get("REEF_TOKEN") or None
+    try:
+        rows = ReefClient(reef_url, token=token).get("/reef/scenarios")["scenarios"]
+    except ReefClientError as exc:
+        if exc.status != 401:
+            raise
+        token = ask("Reef token:", secret=True) or None
+        rows = ReefClient(reef_url, token=token).get("/reef/scenarios")["scenarios"]
+    scenario = scenario or choose_scenario(rows)
+    install = HarnessInstall.create(directory or installs_root() / scenario, reef_url, scenario, token)
+    lines = [install.connect()]
+    binary, pinned = install.record["run"]["binary"], install.record["run"].get("install")
+    agent = find_agent(binary) or installed_agent(binary, pinned)
+    if agent is None and pinned is not None:
+        offer = f"{binary} is not installed. Install {pinned['package']} {pinned['version']}, the version Reef runs?"
+        if confirm(offer, assume_yes=assume_yes):
+            agent = install_agent(binary, pinned)
+            lines.append(f"installed {binary} at {agent}")
+    if agent is None:
+        lines.append(f"{binary} is not installed: install it, then run reef-client harness connect {scenario} again")
+        return "\n".join(lines)
+    install.record["agent"] = agent
+    install.save()
+    if confirm(f"Run {binary} through Reef from now on, with your own configuration as it is?", assume_yes=assume_yes):
+        previous, profile = route_through_reef(binary, scenario, install.directory)
+        if previous not in (None, scenario):
+            lines.append(f"{binary} ran scenario {previous}; it runs {scenario} now")
+        if profile is None:
+            lines.append(f"put {commands_root()} ahead on PATH: your shell is not one reef-client knows")
+        lines.append(f"{binary} now runs through Reef: open a new terminal, then run {binary} as usual")
+    else:
+        lines.append(f"run your agent with: reef-client harness run {scenario}")
+    lines.append(f"undo with: reef-client harness disconnect {scenario}")
+    return "\n".join(lines)
 
 
 def split_command(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -291,9 +520,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     ours, agent_args = split_command(list(sys.argv[1:] if argv is None else argv))
     parser = argparse.ArgumentParser(prog="reef-client harness", description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
-    connect = commands.add_parser("connect", help="install the scenario's head as a layer over your own config")
-    connect.add_argument("scenario")
-    connect.add_argument("--reef", required=True, help="the Reef URL, such as http://127.0.0.1:8900")
+    connect_command = commands.add_parser("connect", help="set this machine up: the layer, the agent and its command")
+    connect_command.add_argument("scenario", nargs="?", help="the scenario; asked for when left out")
+    connect_command.add_argument("--reef", help="the Reef URL, such as http://127.0.0.1:8900; else REEF_URL, or asked")
+    connect_command.add_argument("--yes", "-y", action="store_true", help="install the agent and add its command")
     for name, help in (
         ("run", "sync, run the agent, and sync again when it exits; arguments after -- go to the agent"),
         ("sync", "send the changed files and install the head"),
@@ -310,11 +540,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     if agent_args and arguments.command != "run":
         parser.error("only run takes the agent's arguments after --")
     try:
-        directory = arguments.dir or install_directory(arguments.scenario)
         if arguments.command == "connect":
-            token = os.environ.get("REEF_TOKEN") or None
-            print(HarnessInstall.create(directory, arguments.reef, arguments.scenario, token).connect())
+            print(connect(arguments.scenario, arguments.reef, arguments.dir, assume_yes=arguments.yes))
             return
+        directory = arguments.dir or install_directory(arguments.scenario)
         timeout_s = RUN_SYNC_TIMEOUT_S if arguments.command == "run" else 60.0
         install = HarnessInstall.open(directory, timeout_s=timeout_s)
         if arguments.command == "run":
@@ -329,4 +558,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(f"reef-client harness: {exc}") from exc
 
 
-__all__ = ["INSTALL_FILE", "TOKEN_PLACEHOLDER", "HarnessInstall", "HarnessSyncError", "installs_root", "main"]
+__all__ = [
+    "INSTALL_FILE",
+    "TOKEN_PLACEHOLDER",
+    "HarnessInstall",
+    "HarnessSyncError",
+    "commands_root",
+    "connect",
+    "find_agent",
+    "install_agent",
+    "installs_root",
+    "main",
+    "route_through_reef",
+    "unroute",
+]
