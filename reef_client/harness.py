@@ -1,30 +1,31 @@
 """Run an agent on the harness Reef evolves, over the person's own configuration, and keep the two in sync.
 
-    reef-client harness connect [SCENARIO] [--reef URL] [--yes]
+    reef-client harness connect [SCENARIO] [--reef URL]
     reef-client harness run [SCENARIO] [-- AGENT ARGS]
     reef-client harness sync [SCENARIO] [--discard]
     reef-client harness status [SCENARIO]
     reef-client harness disconnect [SCENARIO] [--discard]
 
-``connect`` sets a machine up in one command, and asks only for what it
-cannot find: the Reef URL (``--reef`` or ``REEF_URL``), the token
-(``REEF_TOKEN``, asked for when Reef refuses the call without one) and the
-scenario (chosen from Reef's list, or a new name). It installs the scenario's
-head in a directory that this client owns, as the adapter's layer: the agent
-loads the person's own configuration as it always does, and the release over
-it, with its model calls going to Reef. The person's own configuration is
-never read or written. When the agent is not installed, ``connect`` offers to
-install the version Reef evaluates with. Then it offers to make the agent's
-own command, such as ``claude``, run through Reef: a command of that name in
-this client's ``bin`` directory, put ahead on ``PATH`` in the shell's startup
-file. ``--yes`` accepts both offers without asking. ``run`` syncs, runs the
-agent with the layer's arguments and variables, and syncs again when the agent
-exits, so every session starts on the newest release and what the session
-changed in the layer, such as Claude Code's memory, reaches Reef before its
-next step. ``sync`` sends the files changed since the install and installs the
-head; Reef merges the changes onto its head as each part's ``merge`` says.
-``--discard`` drops the changes instead. ``status`` shows where the install
-stands, and ``disconnect`` removes it and the agent command it added.
+``connect`` sets a machine up in one command. It asks only for the harness,
+when Reef serves more than one, and the token, when Reef refuses the call
+without one (else ``REEF_TOKEN``); the Reef URL is ``--reef`` or
+``REEF_URL``. It installs the harness's head in a directory that this client
+owns, as the adapter's layer: the agent loads the person's own configuration
+as it always does, and the release over it, with its model calls going to
+Reef. The person's own configuration is never read or written. It installs
+the agent, at the version Reef evaluates with, when the machine lacks it, and
+makes the agent's own command, such as ``claude``, run through Reef: a command
+of that name in this client's ``bin`` directory, put ahead on ``PATH`` in the
+shell's startup file. ``run`` syncs, runs the
+agent with the layer's arguments and variables, and when the agent exits sends
+what the session changed in the layer, such as Claude Code's memory, from a
+process of its own: the terminal is back at once, and the change reaches Reef
+before its next step. ``sync`` sends the files changed since the install and
+installs the head; Reef merges the changes onto its head as each part's
+``merge`` says. An install writes only the files that differ, so a head that is
+the files just sent writes none, and it writes none while an agent session runs
+on the install. ``--discard`` drops the changes instead. ``status`` shows where
+the install stands, and ``disconnect`` removes it and the agent command it added.
 
 The client knows no adapter: the head, in the client form, carries the files,
 the command and the templates of the files that sync. The token comes from
@@ -34,6 +35,8 @@ the command and the templates of the files that sync. The token comes from
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import getpass
 import hashlib
 import json
@@ -45,7 +48,7 @@ import signal
 import subprocess
 import sys
 import urllib.parse
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -57,8 +60,14 @@ INSTALL_FILE = ".reef-install.json"
 TOKEN_PLACEHOLDER = "REEF_TOKEN_PLACEHOLDER"
 #: The key an install gets when the client has no token: some agents refuse to start without one.
 NO_TOKEN_KEY = "reef"
-#: Seconds a sync around a run waits for Reef, so a Reef that does not answer delays a session little.
-RUN_SYNC_TIMEOUT_S = 15.0
+#: Seconds the sync before a run waits for each answer, so a Reef that does not answer delays a session little.
+RUN_SYNC_TIMEOUT_S = 2.0
+#: The lock that each run holds, shared, while its agent runs; an install that writes files holds it alone.
+SESSION_LOCK = ".reef-session.lock"
+#: The lock that a sync holds, so two syncs of one install never run at once.
+SYNC_LOCK = ".reef-sync.lock"
+#: The report of the sync that a run starts in the background when its agent exits; the next run prints it.
+SYNC_LOG = ".reef-sync.log"
 #: The lines around what ``connect`` adds to the shell's startup file, so ``disconnect`` finds it again.
 PROFILE_BLOCK = ("# >>> reef-client >>>", "# <<< reef-client <<<")
 #: The line of an agent command that names the scenario it runs.
@@ -133,14 +142,17 @@ def read_tree(directory: Path, pattern: re.Pattern[str]) -> dict[str, str]:
     return files
 
 
-def confirm(question: str, *, assume_yes: bool) -> bool:
-    """The person's answer to ``question``, yes by default; without a terminal to ask in, yes only when
-    ``assume_yes``."""
-    if assume_yes:
-        return True
-    if not sys.stdin.isatty():
-        return False
-    return input(f"{question} [Y/n] ").strip().lower() in ("", "y", "yes")
+@contextlib.contextmanager
+def locked(path: Path, operation: int) -> Iterator[bool]:
+    """Hold ``fcntl.flock(operation)`` on the file ``path`` for the block; whether it is held: false only when
+    ``operation`` has ``LOCK_NB`` and another process holds a lock that conflicts. Closing the file releases it."""
+    with path.open("a") as file:
+        try:
+            fcntl.flock(file, operation)
+            held = True
+        except BlockingIOError:
+            held = False
+        yield held
 
 
 def ask(question: str, *, secret: bool = False) -> str:
@@ -172,10 +184,11 @@ def install_agent(binary: str, install: Mapping[str, Any]) -> str:
         )
     prefix = agents_root() / binary
     prefix.mkdir(parents=True, exist_ok=True)
-    done = subprocess.run([npm, "install", "--prefix", str(prefix), "--no-fund", "--no-audit", package], check=False)
+    arguments = [npm, "install", "--prefix", str(prefix), "--no-fund", "--no-audit", "--loglevel=error", package]
+    done = subprocess.run(arguments, capture_output=True, text=True, check=False)
     executable = prefix / str(install.get("binary_path"))
     if done.returncode != 0 or not executable.is_file():
-        raise HarnessSyncError(f"npm could not install {package} under {prefix}")
+        raise HarnessSyncError(f"npm could not install {package}: {done.stderr.strip()[-400:]}")
     return str(executable)
 
 
@@ -272,7 +285,8 @@ class HarnessInstall:
     installed release, the digest of each installed file, the command that
     runs the agent (``run``), the templates of the files that sync
     (``synced``) and, once ``connect`` found it, the agent's own executable
-    (``agent``). ``client`` reaches the Reef the record names.
+    (``agent``). The directory also holds ``SESSION_LOCK``, ``SYNC_LOCK`` and
+    ``SYNC_LOG``. ``client`` reaches the Reef the record names.
     Purpose: ``connect`` makes one (``create``); the other commands read it
     back (``open``).
     """
@@ -327,20 +341,38 @@ class HarnessInstall:
 
     # -- the commands ----------------------------------------------------------------------------------------------
 
-    def install(self, manifest: Mapping[str, Any]) -> None:
-        """Write ``manifest``'s files with this client's key, remove the files of the previous install it lacks, and
-        write the record, readable by this user alone: it holds the token."""
+    def install_files(self, manifest: Mapping[str, Any]) -> dict[str, str]:
+        """``manifest``'s files, by path under the install, with this client's key in place of the placeholder."""
         key = self.record.get("token") or NO_TOKEN_KEY
-        files = {path: text.replace(TOKEN_PLACEHOLDER, key) for path, text in manifest["files"].items()}
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self.directory.chmod(0o700)
-        for path in self.record["files"]:
-            if path not in files:
-                (self.directory / path).unlink(missing_ok=True)
+        return {path: text.replace(TOKEN_PLACEHOLDER, key) for path, text in manifest["files"].items()}
+
+    def differing(self, manifest: Mapping[str, Any]) -> list[str]:
+        """The paths that installing ``manifest`` writes or removes, sorted: each of its files that the install lacks
+        or holds with other text, and each file of the previous install that it lacks and that is still there."""
+        files = self.install_files(manifest)
+        paths = [path for path in self.record["files"] if path not in files and (self.directory / path).exists()]
         for path, text in files.items():
             target = self.directory / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(text, encoding="utf-8")
+            if not target.is_file() or target.read_text(encoding="utf-8", errors="replace") != text:
+                paths.append(path)
+        return sorted(paths)
+
+    def install(self, manifest: Mapping[str, Any]) -> list[str]:
+        """Write the ``differing`` paths of ``manifest`` and record it; those paths.
+
+        Installing the release that the files already are writes no file and only moves the record.
+        """
+        files = self.install_files(manifest)
+        paths = self.differing(manifest)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.directory.chmod(0o700)
+        for path in paths:
+            target = self.directory / path
+            if path in files:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(files[path], encoding="utf-8")
+            else:
+                target.unlink(missing_ok=True)
         self.record.update(
             release_id=manifest["release_id"],
             files={path: digest(text) for path, text in files.items()},
@@ -348,6 +380,7 @@ class HarnessInstall:
             synced=manifest["synced"],
         )
         self.save()
+        return paths
 
     def save(self) -> None:
         """Write the record, readable by this user alone: it holds the token."""
@@ -355,20 +388,20 @@ class HarnessInstall:
         record.write_text(json.dumps(self.record, indent=2) + "\n", encoding="utf-8")
         record.chmod(0o600)
 
-    def connect(self) -> str:
-        """Create the scenario when it is new and install its head; a report of the install."""
+    def connect(self) -> dict[str, Any]:
+        """Create the scenario when it is new and install its head; the head's manifest."""
         self.client.post("/reef/scenarios", self.record["scenario"], {"name": self.record["scenario"]})
         manifest = self.head()
         self.install(manifest)
-        lines = [f"installed release {manifest['release_id']} of {self.record['scenario']} at {self.directory}"]
-        return "\n".join([*lines, *required(manifest)])
+        return manifest
 
     def sync(self, *, discard: bool = False) -> str:
         """Send the changed files, then install the head; a report.
 
         Reef merges the changes onto its head, so the head after the import holds them. HarnessSyncError when Reef
-        refuses them; the changed files then stay as they are. ``discard`` sends nothing and installs the head
-        over the changes.
+        refuses them; the changed files then stay as they are. A head that differs from the files waits for the next
+        sync while an agent session runs on the install, so no file changes under the agent. ``discard`` sends
+        nothing and installs the head over the changes; HarnessSyncError while a session runs.
         """
         previous = self.record["release_id"]
         changed = [] if discard else self.changed()
@@ -382,9 +415,16 @@ class HarnessInstall:
         manifest = self.head()
         if manifest["release_id"] == previous and not changed and not discard:
             return f"release {previous} is installed and is the head"
-        # The import reads back in the form Reef renders it, so the install is the release again.
-        self.install(manifest)
-        lines.append(f"installed release {manifest['release_id']} (was {previous})")
+        with locked(self.directory / SESSION_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB) as alone:
+            if not alone and self.differing(manifest):
+                if discard:
+                    raise HarnessSyncError("an agent session runs on this install: discard after it exits")
+                lines.append(f"release {manifest['release_id']} installs at the next run: an agent session runs")
+                return "\n".join(lines)
+            written = self.install(manifest)
+        # A head that is the files just sent writes none: the sent line says it all.
+        if written or not lines:
+            lines.append(f"installed release {manifest['release_id']} (was {previous})")
         return "\n".join([*lines, *required(manifest)])
 
     def status(self) -> str:
@@ -423,12 +463,29 @@ class HarnessInstall:
             print(f"{kept}: Reef did not answer ({exc}); the next run syncs", file=sys.stderr)
 
     def run(self, agent_args: Sequence[str]) -> int:
-        """Sync, run the agent on the layer with ``agent_args`` added, and sync again when it exits; its exit status.
+        """Sync, run the agent on the layer with ``agent_args`` added, and when it exits send what the session changed
+        from a process of its own; the agent's exit status.
 
-        A sync that cannot finish keeps the files, and the agent runs on them. While the agent runs, this process
-        ignores Ctrl-C, which the agent handles, so the sync after it still runs.
+        The sync before the agent waits ``RUN_SYNC_TIMEOUT_S`` for each answer, and is skipped while the send after
+        an earlier session still runs; a sync that cannot finish keeps the files, and the agent runs on them. The send
+        after the agent writes its report to ``SYNC_LOG``, which the next run prints, so the terminal is back at once.
+        While the agent runs, this process holds ``SESSION_LOCK`` shared, so no sync writes a file under the agent,
+        and ignores Ctrl-C, which the agent handles.
         """
-        self.try_sync()
+        log = self.directory / SYNC_LOG
+        with locked(self.directory / SYNC_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB) as free:
+            if free:
+                report = log.read_text(encoding="utf-8").strip() if log.is_file() else ""
+                log.unlink(missing_ok=True)
+                if report:
+                    print(f"after the last session: {report}", file=sys.stderr)
+                self.try_sync()
+            else:
+                print(
+                    f"the last session's changes are still on their way to Reef: this session starts on release "
+                    f"{self.record['release_id']}",
+                    file=sys.stderr,
+                )
         command = self.record["run"]
         # The agent's own executable, never this client's command of the same name, which would run Reef again.
         agent = self.record.get("agent")
@@ -441,37 +498,51 @@ class HarnessInstall:
         interrupt = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             argv = [agent, *command["args"], *agent_args]
-            status = subprocess.run(argv, env={**os.environ, **layer_env}, check=False).returncode
+            with locked(self.directory / SESSION_LOCK, fcntl.LOCK_SH):
+                status = subprocess.run(argv, env={**os.environ, **layer_env}, check=False).returncode
         finally:
             signal.signal(signal.SIGINT, interrupt)
-        self.try_sync()
+        # A send that ended during the session moved the record on disk.
+        changed = HarnessInstall.open(self.directory).changed()
+        if changed:
+            with log.open("w", encoding="utf-8") as report_file:
+                subprocess.Popen(
+                    [sys.executable, "-m", "reef_client", "harness", "sync", "--dir", str(self.directory.resolve())],
+                    stdin=subprocess.DEVNULL,
+                    stdout=report_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            print(f"sending {', '.join(changed)} to Reef in the background", file=sys.stderr)
         return status
 
 
-def choose_scenario(rows: Sequence[Mapping[str, Any]]) -> str:
-    """The scenario the person picks from Reef's ``rows`` by number, or names anew."""
-    if not sys.stdin.isatty():
-        names = ", ".join(str(row.get("scenario")) for row in rows) or "none yet"
-        raise HarnessSyncError(f"name the scenario; Reef has: {names}")
+def choose_harness(rows: Sequence[Mapping[str, Any]]) -> str:
+    """The scenario of the harness the person picks from Reef's ``rows``: the only one without asking, else by its
+    number, its agent or its name; a name of their own when Reef has none yet."""
+    if len(rows) == 1:
+        return str(rows[0]["scenario"])
+    if not rows:
+        return ask("Reef has no harness yet. Name one:") or "default"
     for number, row in enumerate(rows, start=1):
-        adapter = f" ({row['adapter']})" if row.get("adapter") else ""
-        print(f"  {number}. {row.get('scenario')}{adapter}")
-    answer = ask("Scenario: a number from the list, or a new name:" if rows else "Scenario name:")
+        print(f"  {number}. {row.get('adapter') or 'harness'}  {row.get('scenario')}")
+    answer = ask("Harness:")
     if answer.isdigit() and 1 <= int(answer) <= len(rows):
         return str(rows[int(answer) - 1]["scenario"])
-    if not answer:
-        raise HarnessSyncError("no scenario named")
-    return answer
+    matches = [row for row in rows if answer in (row.get("scenario"), row.get("adapter"))]
+    if len(matches) != 1:
+        raise HarnessSyncError(f"pick a harness by its number: {answer!r} names {len(matches)} of them")
+    return str(matches[0]["scenario"])
 
 
-def connect(scenario: str | None, reef_url: str | None, directory: Path | None, *, assume_yes: bool) -> str:
-    """Set this machine up for ``scenario``: install its head as a layer, make sure the agent is installed, and make
-    the agent's own command run through Reef; a report of what it did.
+def connect(scenario: str | None, reef_url: str | None, directory: Path | None) -> str:
+    """Set this machine up for ``scenario``'s harness: install its head as a layer, install the agent when the
+    machine lacks it, and make the agent's own command run through Reef; what the person must still know.
 
-    It asks the person only for what it cannot find: the URL, the token when Reef refuses the call without one, the
-    scenario, and a yes to installing the agent or adding its command.
+    It asks only for the harness, when Reef serves more than one, and the token, when Reef refuses the call without
+    one; the URL is asked for only when neither ``reef_url`` nor ``REEF_URL`` gives it.
     """
-    reef_url = reef_url or os.environ.get("REEF_URL") or ask("Reef URL, such as http://127.0.0.1:8900:")
+    reef_url = reef_url or os.environ.get("REEF_URL") or ask("Reef URL:")
     token = os.environ.get("REEF_TOKEN") or None
     try:
         rows = ReefClient(reef_url, token=token).get("/reef/scenarios")["scenarios"]
@@ -480,31 +551,26 @@ def connect(scenario: str | None, reef_url: str | None, directory: Path | None, 
             raise
         token = ask("Reef token:", secret=True) or None
         rows = ReefClient(reef_url, token=token).get("/reef/scenarios")["scenarios"]
-    scenario = scenario or choose_scenario(rows)
+    scenario = scenario or choose_harness(rows)
     install = HarnessInstall.create(directory or installs_root() / scenario, reef_url, scenario, token)
-    lines = [install.connect()]
-    binary, pinned = install.record["run"]["binary"], install.record["run"].get("install")
+    manifest = install.connect()
+    binary, pinned = manifest["run"]["binary"], manifest["run"].get("install")
     agent = find_agent(binary) or installed_agent(binary, pinned)
-    if agent is None and pinned is not None:
-        offer = f"{binary} is not installed. Install {pinned['package']} {pinned['version']}, the version Reef runs?"
-        if confirm(offer, assume_yes=assume_yes):
-            agent = install_agent(binary, pinned)
-            lines.append(f"installed {binary} at {agent}")
+    if agent is None and pinned is None:
+        raise HarnessSyncError(f"{binary} is not installed: install it, then connect again")
     if agent is None:
-        lines.append(f"{binary} is not installed: install it, then run reef-client harness connect {scenario} again")
-        return "\n".join(lines)
+        # npm takes a while, so the person learns why the command waits.
+        print(f"installing {binary} {pinned['version']}...", file=sys.stderr)
+        agent = install_agent(binary, pinned)
     install.record["agent"] = agent
     install.save()
-    if confirm(f"Run {binary} through Reef from now on, with your own configuration as it is?", assume_yes=assume_yes):
-        previous, profile = route_through_reef(binary, scenario, install.directory)
-        if previous not in (None, scenario):
-            lines.append(f"{binary} ran scenario {previous}; it runs {scenario} now")
-        if profile is None:
-            lines.append(f"put {commands_root()} ahead on PATH: your shell is not one reef-client knows")
-        lines.append(f"{binary} now runs through Reef: open a new terminal, then run {binary} as usual")
-    else:
-        lines.append(f"run your agent with: reef-client harness run {scenario}")
-    lines.append(f"undo with: reef-client harness disconnect {scenario}")
+    previous, profile = route_through_reef(binary, scenario, install.directory)
+    lines = required(manifest)
+    if previous not in (None, scenario):
+        lines.append(f"{binary} now runs {scenario} instead of {previous}")
+    if profile is None:
+        lines.append(f"put {commands_root()} first on PATH: reef-client knows no startup file of your shell")
+    lines.append(f"Done. Open a new terminal and run {binary}.")
     return "\n".join(lines)
 
 
@@ -521,11 +587,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="reef-client harness", description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
     connect_command = commands.add_parser("connect", help="set this machine up: the layer, the agent and its command")
-    connect_command.add_argument("scenario", nargs="?", help="the scenario; asked for when left out")
-    connect_command.add_argument("--reef", help="the Reef URL, such as http://127.0.0.1:8900; else REEF_URL, or asked")
-    connect_command.add_argument("--yes", "-y", action="store_true", help="install the agent and add its command")
+    connect_command.add_argument("scenario", nargs="?", help="the harness's scenario; asked for when Reef has several")
+    connect_command.add_argument("--reef", help="the Reef URL, such as http://127.0.0.1:8900; else REEF_URL")
     for name, help in (
-        ("run", "sync, run the agent, and sync again when it exits; arguments after -- go to the agent"),
+        ("run", "sync, run the agent, and send its changes when it exits; arguments after -- go to the agent"),
         ("sync", "send the changed files and install the head"),
         ("status", "show the installed release, the head and the changed files"),
         ("disconnect", "remove the install"),
@@ -541,7 +606,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("only run takes the agent's arguments after --")
     try:
         if arguments.command == "connect":
-            print(connect(arguments.scenario, arguments.reef, arguments.dir, assume_yes=arguments.yes))
+            print(connect(arguments.scenario, arguments.reef, arguments.dir))
             return
         directory = arguments.dir or install_directory(arguments.scenario)
         timeout_s = RUN_SYNC_TIMEOUT_S if arguments.command == "run" else 60.0
@@ -549,12 +614,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         if arguments.command == "run":
             raise SystemExit(install.run(agent_args))
         if arguments.command == "sync":
-            print(install.sync(discard=arguments.discard))
+            with locked(directory / SYNC_LOCK, fcntl.LOCK_EX):
+                print(install.sync(discard=arguments.discard))
         elif arguments.command == "status":
             print(install.status())
         else:
             print(install.disconnect(discard=arguments.discard))
     except HarnessSyncError as exc:
+        raise SystemExit(f"reef-client harness: {exc}") from exc
+    except (ReefClientError, OSError) as exc:
+        # The send after a run reports to a file the next run prints: a line, not a traceback.
         raise SystemExit(f"reef-client harness: {exc}") from exc
 
 

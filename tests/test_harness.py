@@ -3,6 +3,7 @@ means, and how connect installs the agent and routes its command through Reef.""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import pytest
 
 from reef_client.harness import (
     INSTALL_FILE,
+    SESSION_LOCK,
     TOKEN_PLACEHOLDER,
     HarnessInstall,
     HarnessSyncError,
@@ -20,6 +22,7 @@ from reef_client.harness import (
     find_agent,
     install_agent,
     install_directory,
+    locked,
     read_tree,
     route_through_reef,
     split_command,
@@ -66,6 +69,30 @@ def test_an_install_writes_the_token_keeps_the_command_and_sees_an_edit(tmp_path
     (tmp_path / "s" / "claude" / "settings.json").write_text("{}\n")
     # A config file is Reef's: only the files that sync count as changed.
     assert install.changed() == ["claude/CLAUDE.md", "claude/memory/MEMORY.md"]
+
+
+def test_a_sync_writes_no_file_for_the_files_it_sent_and_none_under_a_session(tmp_path: Path, monkeypatch) -> None:
+    install = HarnessInstall.create(tmp_path / "s", "http://reef.invalid", "s", token=None)
+    base = {"release_id": "r1", "files": {"claude/CLAUDE.md": "Be brief.\n"}, "run": {}, "synced": SYNCED}
+    heads = [base, {**base, "release_id": "r2", "files": {"claude/CLAUDE.md": "Briefer.\n"}}]
+    sent = {"changed": True, "merged": False, "release_id": "r2", "parent_release_id": "r1"}
+    monkeypatch.setattr(install, "head", lambda: heads[-1])
+    monkeypatch.setattr(install, "import_files", lambda files, base_release_id: sent)
+    install.install(base)
+    rules = tmp_path / "s" / "claude" / "CLAUDE.md"
+    rules.write_text("Briefer.\n")
+    with locked(tmp_path / "s" / SESSION_LOCK, fcntl.LOCK_SH):
+        # The head is the files just sent: the record moves, and nothing is written or reported as installed.
+        assert install.sync() == "sent claude/CLAUDE.md as release r2"
+        assert install.record["release_id"] == "r2" and install.changed() == []
+        # A step's release would write a file under the running session, so it waits.
+        heads.append({**base, "release_id": "r3", "files": {"claude/CLAUDE.md": "Briefer, always.\n"}})
+        assert install.sync() == "release r3 installs at the next run: an agent session runs"
+        assert rules.read_text() == "Briefer.\n" and install.record["release_id"] == "r2"
+        with pytest.raises(HarnessSyncError, match="discard after it exits"):
+            install.sync(discard=True)
+    assert install.sync() == "installed release r3 (was r2)"
+    assert rules.read_text() == "Briefer, always.\n"
 
 
 def test_a_command_without_a_scenario_means_the_only_install(tmp_path: Path, monkeypatch) -> None:
@@ -130,5 +157,5 @@ def test_a_missing_agent_installs_its_pinned_npm_package(tmp_path: Path, monkeyp
     executable = install_agent("agent", pinned)
     prefix = tmp_path / "data" / "reef-client" / "agents" / "agent"
     assert executable == str(prefix / "node_modules" / ".bin" / "agent")
-    arguments = ["install", "--prefix", str(prefix), "--no-fund", "--no-audit", "@acme/agent@1.2.3"]
+    arguments = ["install", "--prefix", str(prefix), "--no-fund", "--no-audit", "--loglevel=error", "@acme/agent@1.2.3"]
     assert (prefix / "args").read_text().split() == arguments
