@@ -19,8 +19,8 @@ of that name in this client's ``bin`` directory, put ahead on ``PATH`` in the
 shell's startup file. ``run`` syncs, runs the
 agent with the layer's arguments and variables, and when the agent exits sends
 what the session changed in the layer, such as Claude Code's memory, from a
-process of its own: the terminal is back at once, and the change reaches Reef
-before its next step. ``sync`` sends the files changed since the install and
+process of its own: the terminal is back at once. Reef refuses the send while a
+step runs, and the change then waits for the next ``run`` or ``sync``. ``sync`` sends the files changed since the install and
 installs the head; Reef merges the changes onto its head as each part's
 ``merge`` says. An install writes only the files that differ, so a head that is
 the files just sent writes none, and it writes none while an agent session runs
