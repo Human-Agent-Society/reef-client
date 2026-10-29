@@ -17,7 +17,7 @@ import package is the inner [`reef_client/`](reef_client) directory:
   configuration, which it never writes. `reef-client harness connect` sets a
   machine up in one command: it asks at most for the token and, when Reef
   serves several, the harness; it installs the agent when it is missing, and
-  makes the agent's own command, such as `claude`, run through Reef. Each run syncs before the agent starts. When the agent exits,
+  makes the agent's own command run through Reef. The Reef deployment decides the agent (its `evolution.adapter`). Each run syncs before the agent starts. When the agent exits,
   a background process sends what the session changed in the layer, such as
   Claude Code's memory, so the terminal is back at once. While a training
   step runs, Reef refuses the send, and the change waits for the next `run`
