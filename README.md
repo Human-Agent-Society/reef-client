@@ -10,10 +10,18 @@ import package is the inner [`reef_client/`](reef_client) directory:
 
 - [`client.py`](reef_client/client.py) is `ReefClient`, the
   ask/observe/report loop every example shares (see the
-  [Reef docs](https://github.com/Human-Agent-Society/reef/blob/main/docs/reference/reef-client.md)),
-  plus the harness update channel reads: `harness_versions` (the version
-  catalog with gate metrics) and `harness_pull` (write one served tree, head
-  or version-addressed, into a directory).
+  [Reef docs](https://github.com/Human-Agent-Society/reef/blob/main/docs/reference/reef-client.md)).
+- [`harness.py`](reef_client/harness.py) syncs an agent's harness with Reef
+  (`reef-client harness connect|run|sync|status|disconnect`): it runs the
+  agent with the release Reef serves as a layer over the person's own
+  configuration, which it never writes. `reef-client harness connect` sets a
+  machine up in one command: it asks at most for the token and, when Reef
+  serves several, the harness; it installs the agent when it is missing, and
+  makes the agent's own command run through Reef. The Reef deployment decides the agent (its `evolution.adapter`). Each run syncs before the agent starts. When the agent exits,
+  a background process sends what the session changed in the layer, such as
+  Claude Code's memory, so the terminal is back at once. While a training
+  step runs, Reef refuses the send, and the change waits for the next `run`
+  or `sync`.
 - [`skill.py`](reef_client/skill.py) fetches and syncs the scenario's served
   skill file (`fetch_skill`/`sync_skill`);
 - [`sse.py`](reef_client/sse.py) converts between buffered chat completions
