@@ -24,7 +24,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "command",
         choices=("import", "harness"),
         help="import: upload a records JSONL file with resumable batches; "
-        "harness: sync an agent's harness with Reef and run the agent on its release",
+        "harness: sync an agent's harness with Reef and run the agent on its artifact",
     )
     parser.parse_args(arguments)
 

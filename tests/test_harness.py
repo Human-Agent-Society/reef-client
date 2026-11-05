@@ -55,12 +55,12 @@ def test_an_install_writes_the_token_keeps_the_command_and_sees_an_edit(tmp_path
     (tmp_path / "s" / "claude" / "skills" / "old" / "SKILL.md").write_text("old\n")
     files = {"claude/CLAUDE.md": "Be brief.\n", "claude/settings.json": f'{{"key": "{TOKEN_PLACEHOLDER}"}}\n'}
     run = {"binary": "claude", "args": ["--settings", "x"], "env": {}}
-    install.install({"release_id": "r1", "files": files, "run": run, "synced": SYNCED})
+    install.install({"artifact_id": "r1", "files": files, "run": run, "synced": SYNCED})
     assert json.loads((tmp_path / "s" / "claude" / "settings.json").read_text()) == {"key": "secret"}
     # The previous install's file is gone; the record, which holds the token, is the user's alone.
     assert not (tmp_path / "s" / "claude" / "skills" / "old" / "SKILL.md").exists()
     saved = json.loads((tmp_path / "s" / INSTALL_FILE).read_text())
-    assert saved["release_id"] == "r1" and saved["run"] == run and saved["token"] == "secret"
+    assert saved["artifact_id"] == "r1" and saved["run"] == run and saved["token"] == "secret"
     assert (tmp_path / "s" / INSTALL_FILE).stat().st_mode & 0o077 == 0
     assert install.changed() == []
     (tmp_path / "s" / "claude" / "CLAUDE.md").write_text("Briefer.\n")
@@ -73,25 +73,25 @@ def test_an_install_writes_the_token_keeps_the_command_and_sees_an_edit(tmp_path
 
 def test_a_sync_writes_no_file_for_the_files_it_sent_and_none_under_a_session(tmp_path: Path, monkeypatch) -> None:
     install = HarnessInstall.create(tmp_path / "s", "http://reef.invalid", "s", token=None)
-    base = {"release_id": "r1", "files": {"claude/CLAUDE.md": "Be brief.\n"}, "run": {}, "synced": SYNCED}
-    heads = [base, {**base, "release_id": "r2", "files": {"claude/CLAUDE.md": "Briefer.\n"}}]
-    sent = {"changed": True, "merged": False, "release_id": "r2", "parent_release_id": "r1"}
+    base = {"artifact_id": "r1", "files": {"claude/CLAUDE.md": "Be brief.\n"}, "run": {}, "synced": SYNCED}
+    heads = [base, {**base, "artifact_id": "r2", "files": {"claude/CLAUDE.md": "Briefer.\n"}}]
+    sent = {"changed": True, "merged": False, "artifact_id": "r2", "parent_artifact_id": "r1"}
     monkeypatch.setattr(install, "head", lambda: heads[-1])
-    monkeypatch.setattr(install, "import_files", lambda files, base_release_id: sent)
+    monkeypatch.setattr(install, "import_files", lambda files: sent)
     install.install(base)
     rules = tmp_path / "s" / "claude" / "CLAUDE.md"
     rules.write_text("Briefer.\n")
     with locked(tmp_path / "s" / SESSION_LOCK, fcntl.LOCK_SH):
         # The head is the files just sent: the record moves, and nothing is written or reported as installed.
-        assert install.sync() == "sent claude/CLAUDE.md as release r2"
-        assert install.record["release_id"] == "r2" and install.changed() == []
-        # A step's release would write a file under the running session, so it waits.
-        heads.append({**base, "release_id": "r3", "files": {"claude/CLAUDE.md": "Briefer, always.\n"}})
-        assert install.sync() == "release r3 installs at the next run: an agent session runs"
-        assert rules.read_text() == "Briefer.\n" and install.record["release_id"] == "r2"
+        assert install.sync() == "sent claude/CLAUDE.md as artifact r2"
+        assert install.record["artifact_id"] == "r2" and install.changed() == []
+        # A step's artifact would write a file under the running session, so it waits.
+        heads.append({**base, "artifact_id": "r3", "files": {"claude/CLAUDE.md": "Briefer, always.\n"}})
+        assert install.sync() == "artifact r3 installs at the next run: an agent session runs"
+        assert rules.read_text() == "Briefer.\n" and install.record["artifact_id"] == "r2"
         with pytest.raises(HarnessSyncError, match="discard after it exits"):
             install.sync(discard=True)
-    assert install.sync() == "installed release r3 (was r2)"
+    assert install.sync() == "installed artifact r3 (was r2)"
     assert rules.read_text() == "Briefer, always.\n"
 
 
@@ -106,15 +106,15 @@ def test_the_agents_register_commands_run_once_per_release_until_disconnect_undo
     run = {"binary": "codex", "args": [], "env": {}, "register": [["plugin", "add", "reef@reef"]]}
     run["unregister"] = [["plugin", "remove", "reef@reef"]]
     install = HarnessInstall.create(tmp_path / "s", "http://reef.invalid", "s", token=None)
-    install.install({"release_id": "r1", "files": {}, "run": run, "synced": []})
+    install.install({"artifact_id": "r1", "files": {}, "run": run, "synced": []})
     install.record["agent"] = str(agent)
     install.register()
     install.register()
-    install.install({"release_id": "r2", "files": {}, "run": run, "synced": []})
+    install.install({"artifact_id": "r2", "files": {}, "run": run, "synced": []})
     install.register()
     assert log.read_text() == "plugin add reef@reef\n" * 2
     # A command that fails names itself, and the next run tries the release again.
-    install.install({"release_id": "r3", "files": {}, "run": {**run, "register": [["fail"]]}, "synced": []})
+    install.install({"artifact_id": "r3", "files": {}, "run": {**run, "register": [["fail"]]}, "synced": []})
     with pytest.raises(HarnessSyncError, match="codex fail failed"):
         install.register()
     assert install.record["registered"] == "r2"

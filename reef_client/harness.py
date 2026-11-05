@@ -10,12 +10,12 @@
 when Reef serves more than one, and the token, when Reef refuses the call
 without one (else ``REEF_TOKEN``); the Reef URL is ``--reef`` or
 ``REEF_URL``. It installs the harness's head in a directory that this client
-owns. The release there is a plugin of the agent, and the agent's own
-commands, which the release names (``register``), install it, such as
+owns. The artifact there is a plugin of the agent, and the agent's own
+commands, which the artifact names (``register``), install it, such as
 ``claude plugin install`` or ``pi install``: the agent then loads it in every
 session, beside the person's own configuration, which this client never
 reads or writes. ``connect`` and each ``run`` run those commands once per
-installed release, while no other session runs on the install, and
+installed artifact, while no other session runs on the install, and
 ``disconnect`` undoes them (``unregister``). ``connect`` first undoes them
 for the install that the agent's command ran before. It installs
 the agent, at the version Reef evaluates with, when the machine lacks it, and
@@ -23,7 +23,7 @@ makes the agent's own command, such as ``claude``, run through Reef: a command
 of that name in this client's ``bin`` directory, put ahead on ``PATH`` in the
 shell's startup file. A session that it starts sends its model calls to Reef.
 ``run`` syncs, runs the agent with the layer's arguments and variables, and
-when the agent exits sends what the session changed in the release, from a
+when the agent exits sends what the session changed in the artifact, from a
 process of its own: the terminal is back at once. Reef refuses the send while a
 step runs, and the change then waits for the next ``run`` or ``sync``. ``sync`` sends the files changed since the install and
 installs the head; Reef merges the changes onto its head as each part's
@@ -122,10 +122,10 @@ def file_pattern(templates: Sequence[str]) -> re.Pattern[str]:
 
 
 def required(manifest: Mapping[str, Any]) -> list[str]:
-    """One line per item a release ``requires`` of this machine, with the sentence it asks the person; the client
+    """One line per item an artifact ``requires`` of this machine, with the sentence it asks the person; the client
     runs no check: a person reads a check before running it."""
     return [
-        f"the release requires {item.get('kind')} {item.get('name')}: {item.get('prompt') or 'no prompt given'}"
+        f"the artifact requires {item.get('kind')} {item.get('name')}: {item.get('prompt') or 'no prompt given'}"
         for item in manifest.get("requires") or []
     ]
 
@@ -287,11 +287,11 @@ class HarnessInstall:
 
     Values: ``directory`` holds the installed files at their render paths and
     ``INSTALL_FILE``, the record: the Reef URL, the scenario, the token, the
-    installed release, the digest of each installed file, the command that
+    installed artifact, the digest of each installed file, the command that
     runs the agent and the agent's commands that record and remove the
     install (``run``), the templates of the files that sync (``synced``),
     once ``connect`` found it, the agent's own executable (``agent``), and
-    the release whose files the agent's ``register`` commands last recorded
+    the artifact whose files the agent's ``register`` commands last recorded
     (``registered``). The directory also holds ``SESSION_LOCK``, ``SYNC_LOCK`` and
     ``SYNC_LOG``. ``client`` reaches the Reef the record names.
     Purpose: ``connect`` makes one (``create``); the other commands read it
@@ -312,11 +312,11 @@ class HarnessInstall:
 
     @classmethod
     def create(cls, directory: Path, reef_url: str, scenario: str, token: str | None) -> HarnessInstall:
-        record = {"reef_url": reef_url.rstrip("/"), "scenario": scenario, "token": token, "release_id": None}
+        record = {"reef_url": reef_url.rstrip("/"), "scenario": scenario, "token": token, "artifact_id": None}
         return cls(directory, {**record, "files": {}, "run": None, "synced": []})
 
     def changed(self) -> list[str]:
-        """The harness files of the install that differ from the installed release: changed, added or removed."""
+        """The harness files of the install that differ from the installed artifact: changed, added or removed."""
         pattern = file_pattern(self.record["synced"])
         installed = {path: checksum for path, checksum in self.record["files"].items() if pattern.fullmatch(path)}
         current = {path: digest(text) for path, text in read_tree(self.directory, pattern).items()}
@@ -325,20 +325,32 @@ class HarnessInstall:
     # -- the routes ------------------------------------------------------------------------------------------------
 
     def head(self) -> dict[str, Any]:
-        """The head release in the client form: the layer's files under this install, and the command."""
+        """The head artifact in the client form: the layer's files under this install, and the command."""
         query = urllib.parse.urlencode(
             {"form": "client", "service_url": self.record["reef_url"], "root": str(self.directory.resolve())}
         )
         return self.client.get(f"/reef/harness?{query}", extra_headers={"x-reef-scenario": self.record["scenario"]})
 
-    def import_files(self, files: Mapping[str, str], base_release_id: str) -> dict[str, Any]:
+    @property
+    def installed_id(self) -> str | None:
+        """The installed artifact's ID. An install from an older client holds only the ``release_id`` of its release."""
+        return self.record.get("artifact_id") or self.record.get("release_id")
+
+    def import_files(self, files: Mapping[str, str]) -> dict[str, Any]:
         """``POST /reef/harness/import``; HarnessSyncError for a refusal the person resolves: a file that fails
         Reef's checks (HTTP 400), a file that the head changed too, or a step that is running (HTTP 409)."""
         try:
             answer, _ = self.client.post(
                 "/reef/harness/import",
                 self.record["scenario"],
-                {"files": dict(files), "base_release_id": base_release_id},
+                {
+                    "files": dict(files),
+                    **(
+                        {"base_artifact_id": self.record["artifact_id"]}
+                        if self.record.get("artifact_id")
+                        else {"base_release_id": self.record["release_id"]}
+                    ),
+                },
             )
         except ReefClientError as exc:
             if exc.status in (400, 409):
@@ -367,7 +379,7 @@ class HarnessInstall:
     def install(self, manifest: Mapping[str, Any]) -> list[str]:
         """Write the ``differing`` paths of ``manifest`` and record it; those paths.
 
-        Installing the release that the files already are writes no file and only moves the record.
+        Installing the artifact that the files already are writes no file and only moves the record.
         """
         files = self.install_files(manifest)
         paths = self.differing(manifest)
@@ -380,8 +392,9 @@ class HarnessInstall:
                 target.write_text(files[path], encoding="utf-8")
             else:
                 target.unlink(missing_ok=True)
+        self.record.pop("release_id", None)
         self.record.update(
-            release_id=manifest["release_id"],
+            artifact_id=manifest["artifact_id"],
             files={path: digest(text) for path, text in files.items()},
             run=manifest["run"],
             synced=manifest["synced"],
@@ -406,10 +419,10 @@ class HarnessInstall:
         return agent
 
     def register(self) -> None:
-        """Run the agent's ``register`` commands on the installed release, once per release, so the agent loads
+        """Run the agent's ``register`` commands on the installed artifact, once per artifact, so the agent loads
         what it reads from no path a flag names; HarnessSyncError naming a command that failed."""
         commands = self.record["run"].get("register") or []
-        if not commands or self.record.get("registered") == self.record["release_id"]:
+        if not commands or self.record.get("registered") == self.installed_id:
             return
         agent = self.agent()
         for command in commands:
@@ -418,11 +431,11 @@ class HarnessInstall:
                 raise HarnessSyncError(
                     f"{self.record['run']['binary']} {shlex.join(command)} failed: {done.stderr.strip()[-400:]}"
                 )
-        self.record["registered"] = self.record["release_id"]
+        self.record["registered"] = self.installed_id
         self.save()
 
     def unregister(self) -> list[str]:
-        """Run the agent's ``unregister`` commands, each even when one before it failed, and record that no release
+        """Run the agent's ``unregister`` commands, each even when one before it failed, and record that no artifact
         is registered; a line per command that did not finish, with the command for the person to run."""
         if self.record.get("registered") is None:
             return []
@@ -457,38 +470,38 @@ class HarnessInstall:
         sync while an agent session runs on the install, so no file changes under the agent. ``discard`` sends
         nothing and installs the head over the changes; HarnessSyncError while a session runs.
         """
-        previous = self.record["release_id"]
+        previous = self.installed_id
         changed = [] if discard else self.changed()
         lines = []
         if changed:
             files = read_tree(self.directory, file_pattern(self.record["synced"]))
-            answer = self.import_files(files, previous)
+            answer = self.import_files(files)
             if answer["changed"]:
-                onto = f", merged onto release {answer['parent_release_id']}" if answer["merged"] else ""
-                lines.append(f"sent {', '.join(changed)} as release {answer['release_id']}{onto}")
+                onto = f", merged onto artifact {answer['parent_artifact_id']}" if answer["merged"] else ""
+                lines.append(f"sent {', '.join(changed)} as artifact {answer['artifact_id']}{onto}")
         manifest = self.head()
-        if manifest["release_id"] == previous and not changed and not discard:
-            return f"release {previous} is installed and is the head"
+        if manifest["artifact_id"] == previous and not changed and not discard:
+            return f"artifact {previous} is installed and is the head"
         with locked(self.directory / SESSION_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB) as alone:
             if not alone and self.differing(manifest):
                 if discard:
                     raise HarnessSyncError("an agent session runs on this install: discard after it exits")
-                lines.append(f"release {manifest['release_id']} installs at the next run: an agent session runs")
+                lines.append(f"artifact {manifest['artifact_id']} installs at the next run: an agent session runs")
                 return "\n".join(lines)
             written = self.install(manifest)
         # A head that is the files just sent writes none: the sent line says it all.
         if written or not lines:
-            lines.append(f"installed release {manifest['release_id']} (was {previous})")
+            lines.append(f"installed artifact {manifest['artifact_id']} (was {previous})")
         return "\n".join([*lines, *required(manifest)])
 
     def status(self) -> str:
-        head = self.head()["release_id"]
+        head = self.head()["artifact_id"]
         changed = self.changed()
         return "\n".join(
             [
                 f"scenario {self.record['scenario']} on {self.record['reef_url']}: {self.record['run']['binary']}",
-                f"installed release {self.record['release_id']} at {self.directory}",
-                "the head" if head == self.record["release_id"] else f"the head is release {head}: sync to install it",
+                f"installed artifact {self.installed_id} at {self.directory}",
+                "the head" if head == self.installed_id else f"the head is artifact {head}: sync to install it",
                 f"changed, not sent: {', '.join(changed)}" if changed else "no file changed since the install",
             ]
         )
@@ -509,7 +522,7 @@ class HarnessInstall:
 
     def try_sync(self) -> None:
         """``sync``, telling the person on stderr why a sync that could not finish keeps the files as they are."""
-        kept = f"kept your files on release {self.record['release_id']}"
+        kept = f"kept your files on artifact {self.installed_id}"
         try:
             print(self.sync(), file=sys.stderr)
         except HarnessSyncError as exc:
@@ -537,8 +550,8 @@ class HarnessInstall:
                 self.try_sync()
             else:
                 print(
-                    f"the last session's changes are still on their way to Reef: this session starts on release "
-                    f"{self.record['release_id']}",
+                    f"the last session's changes are still on their way to Reef: this session starts on artifact "
+                    f"{self.installed_id}",
                     file=sys.stderr,
                 )
         command = self.record["run"]
@@ -621,7 +634,7 @@ def connect(scenario: str | None, reef_url: str | None, directory: Path | None) 
         agent = install_agent(binary, pinned)
     install.record["agent"] = agent
     install.save()
-    # The agent loads every release it has installed, so the one its command ran before leaves first.
+    # The agent loads every artifact it has installed, so the one its command ran before leaves first.
     before = command_scenario(commands_root() / binary)
     lines = required(manifest)
     if before not in (None, scenario) and (installs_root() / before / INSTALL_FILE).is_file():
@@ -654,7 +667,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     for name, help in (
         ("run", "sync, run the agent, and send its changes when it exits; arguments after -- go to the agent"),
         ("sync", "send the changed files and install the head"),
-        ("status", "show the installed release, the head and the changed files"),
+        ("status", "show the installed artifact, the head and the changed files"),
         ("disconnect", "remove the install"),
     ):
         command = commands.add_parser(name, help=help)
