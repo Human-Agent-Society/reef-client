@@ -13,7 +13,7 @@ import package is the inner [`reef_client/`](reef_client) directory:
   [Reef docs](https://github.com/Human-Agent-Society/reef/blob/main/docs/reference/reef-client.md)).
 - [`harness.py`](reef_client/harness.py) syncs an agent's harness with Reef
   (`reef-client harness connect|run|sync|status|disconnect`): it runs the
-  agent with the release Reef serves as a layer over the person's own
+  agent with the artifact Reef serves as a layer over the person's own
   configuration, which it never writes. `reef-client harness connect` sets a
   machine up in one command: it asks at most for the token and, when Reef
   serves several, the harness; it installs the agent when it is missing, and
