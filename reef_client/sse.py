@@ -14,6 +14,8 @@ Two directions, both stdlib-only:
 
 Both directions carry every field of a message, not a list of known ones: a field that one of them dropped, such
 as a reasoning model's ``reasoning``, never reached the agent, which then sent the model a history without it.
+The accumulator reads the three streams that a model call can answer with: Chat Completions chunks, OpenAI
+Responses events and Anthropic Messages events.
 """
 
 from __future__ import annotations
@@ -32,6 +34,26 @@ MESSAGE_FIELDS = ("role", "content", "tool_calls")
 CHUNK_FIELDS = ("id", "object", "created", "model", "choices", "usage", "reef")
 #: The choice fields that ``SSEAccumulator`` reads by their own rules.
 CHOICE_FIELDS = ("index", "delta", "finish_reason")
+#: The event types of an Anthropic Messages stream.
+MESSAGE_EVENTS = (
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+    "ping",
+)
+
+
+def added_up(kept: Any, value: Any) -> Any:
+    """``value`` added to ``kept``, the value so far of one field of a stream: text and lists add up, and any other
+    value replaces ``kept``. Purpose: the accumulator keeps a field that it has no rule for as the stream sent it."""
+    if isinstance(value, str) and (kept is None or isinstance(kept, str)):
+        return (kept or "") + value
+    if isinstance(value, list) and isinstance(kept, list):
+        return kept + value
+    return value
 
 
 def synthesize_sse_events(
@@ -111,8 +133,18 @@ class SSEAccumulator:
     follows OpenAI semantics: content and tool-call arguments accumulate by
     (choice index, tool-call index), scalar fields keep their first value.
     Every other delta field is kept under its own name: text adds up, another
-    value replaces the one before it. A choice's ``logprobs.content`` adds up,
-    and each other field of a chunk or of a choice keeps its last value.
+    value replaces the one before it. Each other field of a choice adds up the
+    same way, lists too (``token_ids``), and ``logprobs.content`` adds up; each
+    other field of a chunk keeps its last value.
+
+    An OpenAI Responses stream gives the response that its last event holding one
+    carries (``response.completed``, ``response.incomplete`` or
+    ``response.failed``). An Anthropic Messages stream gives the message that its
+    events build: ``message_start`` gives the message, each content block adds up
+    its deltas (``input_json_delta`` text becomes the block's ``input`` when the
+    block stops), and ``message_delta`` sets its delta, adds its ``usage`` and sets
+    each other field it holds. An ``error`` event of either stream is the
+    completion when the stream gave nothing else.
     """
 
     def __init__(self) -> None:
@@ -125,6 +157,11 @@ class SSEAccumulator:
         self.usage: dict[str, Any] | None = None
         self.agent_record_id: str | None = None
         self._extra: dict[str, Any] = {}
+        self._response: dict[str, Any] | None = None
+        self._message: dict[str, Any] | None = None
+        self._blocks: dict[int, dict[str, Any]] = {}
+        self._partial_json: dict[int, str] = {}
+        self._error: dict[str, Any] | None = None
         self._choices: dict[int, dict[str, Any]] = {}
 
     def feed(self, data: bytes) -> None:
@@ -158,6 +195,17 @@ class SSEAccumulator:
             self._apply_chunk(chunk)
 
     def _apply_chunk(self, chunk: dict[str, Any]) -> None:
+        kind = chunk.get("type")
+        if kind == "error":
+            self._error = chunk
+            return
+        if isinstance(kind, str) and kind.startswith("response."):
+            if isinstance(chunk.get("response"), dict):
+                self._response = chunk["response"]
+            return
+        if kind in MESSAGE_EVENTS:
+            self._apply_message_event(chunk)
+            return
         self.id = chunk.get("id") or self.id
         self.model = chunk.get("model") or self.model
         self.created = chunk.get("created") or self.created
@@ -183,11 +231,8 @@ class SSEAccumulator:
             for field, value in delta.items():
                 if field in MESSAGE_FIELDS or value is None:
                     continue
-                kept = slot["fields"].get(field)
-                if isinstance(value, str) and (kept is None or isinstance(kept, str)):
-                    slot["fields"][field] = (kept or "") + value
-                elif value != "":
-                    slot["fields"][field] = value
+                if value != "" or field in slot["fields"]:
+                    slot["fields"][field] = added_up(slot["fields"].get(field), value)
             for field, value in choice.items():
                 if field in CHOICE_FIELDS or value is None:
                     continue
@@ -201,7 +246,7 @@ class SSEAccumulator:
                 ):
                     slot["choice"][field] = {**kept, **value, "content": kept["content"] + value["content"]}
                 else:
-                    slot["choice"][field] = value
+                    slot["choice"][field] = added_up(kept, value)
             for call in delta.get("tool_calls") or []:
                 acc = slot["tool_calls"].setdefault(
                     call.get("index", 0), {"id": None, "type": None, "name": [], "arguments": []}
@@ -218,11 +263,63 @@ class SSEAccumulator:
             if choice.get("finish_reason"):
                 slot["finish_reason"] = choice["finish_reason"]
 
+    def _apply_message_event(self, event: dict[str, Any]) -> None:
+        kind = event["type"]
+        if kind == "message_start" and isinstance(event.get("message"), dict):
+            self._message = dict(event["message"])
+            for index, block in enumerate(self._message.get("content") or []):
+                if isinstance(block, dict):
+                    self._blocks[index] = dict(block)
+            return
+        index = event.get("index")
+        if kind == "content_block_start" and isinstance(index, int) and isinstance(event.get("content_block"), dict):
+            self._blocks[index] = dict(event["content_block"])
+            return
+        if kind == "content_block_delta" and isinstance(index, int) and isinstance(event.get("delta"), dict):
+            block = self._blocks.setdefault(index, {})
+            for field, value in event["delta"].items():
+                if field == "type" or value is None:
+                    continue
+                if field == "partial_json" and isinstance(value, str):
+                    self._partial_json[index] = self._partial_json.get(index, "") + value
+                elif field == "citation":
+                    block.setdefault("citations", []).append(value)
+                else:
+                    block[field] = added_up(block.get(field), value)
+            return
+        if kind == "content_block_stop" and isinstance(index, int) and index in self._partial_json:
+            text = self._partial_json.pop(index)
+            try:
+                self._blocks.setdefault(index, {})["input"] = json.loads(text) if text else {}
+            except json.JSONDecodeError:
+                # The tool's arguments as the model wrote them: a capture keeps what the stream sent.
+                self._blocks[index]["input"] = text
+            return
+        if kind == "message_delta":
+            message = self._message if self._message is not None else {}
+            self._message = message
+            if isinstance(event.get("delta"), dict):
+                message.update({field: value for field, value in event["delta"].items()})
+            if isinstance(event.get("usage"), dict):
+                usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+                message["usage"] = {**usage, **event["usage"]}
+            for field, value in event.items():
+                if field not in ("type", "delta", "usage") and value is not None:
+                    message[field] = value
+
     @property
     def completion(self) -> dict[str, Any] | None:
-        """The accumulated completion, or None if no chunk arrived yet."""
+        """The accumulated completion, or None if no chunk arrived yet: a chat completion, an OpenAI response or
+        an Anthropic message, as the stream was."""
+        if self._response is not None:
+            return self._response
+        if self._message is not None:
+            for index, text in self._partial_json.items():
+                # A block that never stopped: keep the arguments as they came.
+                self._blocks.setdefault(index, {}).setdefault("input", text)
+            return {**self._message, "content": [self._blocks[index] for index in sorted(self._blocks)]}
         if not self._choices and self.usage is None:
-            return None
+            return self._error
         choices = []
         for index in sorted(self._choices):
             slot = self._choices[index]
