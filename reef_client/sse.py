@@ -20,6 +20,10 @@ import json
 from typing import Any
 
 
+#: The message fields that carry a model's reasoning text: vLLM writes ``reasoning``, and others ``reasoning_content``.
+REASONING_FIELDS = ("reasoning", "reasoning_content")
+
+
 def synthesize_sse_events(
     payload: dict[str, Any],
     *,
@@ -47,6 +51,11 @@ def synthesize_sse_events(
     for index, choice in enumerate(payload.get("choices", [])):
         message = choice.get("message") or {}
         emit({"role": message.get("role", "assistant")}, index)
+        # A reasoning model's thinking, under the upstream's own field name: an agent that never receives it
+        # cannot send it back, and the model then reads a history of its own empty turns.
+        for field in REASONING_FIELDS:
+            if isinstance(message.get(field), str) and message[field]:
+                emit({field: message[field]}, index)
         content = message.get("content")
         if content:
             emit({"content": content}, index)
@@ -151,6 +160,9 @@ class SSEAccumulator:
                 slot["role"] = delta["role"]
             if delta.get("content"):
                 slot["content"].append(delta["content"])
+            for field in REASONING_FIELDS:
+                if isinstance(delta.get(field), str) and delta[field]:
+                    slot.setdefault(field, []).append(delta[field])
             for call in delta.get("tool_calls") or []:
                 acc = slot["tool_calls"].setdefault(
                     call.get("index", 0), {"id": None, "type": None, "name": [], "arguments": []}
@@ -179,6 +191,9 @@ class SSEAccumulator:
                 "role": slot["role"] or "assistant",
                 "content": "".join(slot["content"]),
             }
+            for field in REASONING_FIELDS:
+                if slot.get(field):
+                    message[field] = "".join(slot[field])
             if slot["tool_calls"]:
                 message["tool_calls"] = [
                     {
