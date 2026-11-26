@@ -68,7 +68,11 @@ def synthesize_sse_events(
     token-by-token; client SDKs treat delta granularity as an implementation
     detail, so one large delta is protocol-valid. Every other field of the
     message that holds a value, such as ``reasoning`` or ``reasoning_content``,
-    is a delta of its own before the content, under its own name.
+    is a delta of its own before the content, under its own name. Every other
+    field of a choice, such as ``logprobs`` or ``token_ids``, rides on the
+    choice's closing chunk, and every other field of the completion, such as
+    ``prompt_token_ids`` or a private ``training`` block, on a closing chunk of
+    its own: ``SSEAccumulator`` rebuilds the whole completion from the stream.
     """
     base = {
         "id": payload.get("id", "chatcmpl-reef-client"),
@@ -111,8 +115,20 @@ def synthesize_sse_events(
                 },
                 index,
             )
-        emit({}, index, finish_reason=choice.get("finish_reason", "stop"))
+        extra = {
+            field: value for field, value in choice.items() if field not in ("index", "message", "finish_reason")
+        }
+        chunk = {
+            **base,
+            "choices": [
+                {"index": index, "delta": {}, "finish_reason": choice.get("finish_reason", "stop"), **extra}
+            ],
+        }
+        events.append(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n")
 
+    rest = {field: value for field, value in payload.items() if field not in CHUNK_FIELDS}
+    if rest:
+        events.append(f"data: {json.dumps({**base, 'choices': [], **rest}, ensure_ascii=False)}\n\n")
     if include_usage and payload.get("usage") is not None:
         events.append(
             f"data: {json.dumps({**base, 'choices': [], 'usage': payload['usage']}, ensure_ascii=False)}\n\n"

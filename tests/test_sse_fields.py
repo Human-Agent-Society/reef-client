@@ -165,3 +165,30 @@ def test_an_error_event_is_the_completion_of_a_stream_that_gave_nothing_else() -
     error = {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}
 
     assert accumulated_events(error) == error
+
+
+def test_a_synthesized_stream_carries_every_field_of_the_choice_and_of_the_completion() -> None:
+    payload = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "m",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "five"},
+                "finish_reason": "stop",
+                "logprobs": {"content": [{"token": "five", "logprob": -0.1}]},
+                "token_ids": [5],
+            }
+        ],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+        "prompt_token_ids": [1, 2],
+        "training": {"tokens": [1, 2, 5], "loss_mask": [1], "rollout_log_probs": [-0.1]},
+    }
+
+    accumulator = SSEAccumulator()
+    accumulator.feed("".join(synthesize_sse_events(payload, include_usage=True)).encode())
+    accumulator.finish()
+
+    assert accumulator.completion == payload
