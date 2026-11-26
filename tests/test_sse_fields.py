@@ -82,3 +82,86 @@ def test_a_synthesized_stream_and_the_accumulator_keep_every_message_field() -> 
 
     assert accumulator.completion is not None
     assert accumulator.completion["choices"][0]["message"] == message
+
+
+def event_frames(*events: dict[str, object]) -> bytes:
+    return b"".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode() for event in events)
+
+
+def accumulated_events(*events: dict[str, object]) -> dict[str, object] | None:
+    accumulator = SSEAccumulator()
+    payload = event_frames(*events)
+    # Awkward slices split frames and multi-byte text.
+    for offset in range(0, len(payload), 5):
+        accumulator.feed(payload[offset : offset + 5])
+    accumulator.finish()
+    return accumulator.completion
+
+
+def test_the_accumulator_adds_up_a_choices_token_ids() -> None:
+    completion = accumulated(
+        {**chunk({"role": "assistant", "content": "a"}, token_ids=[1]), "prompt_token_ids": [7, 8]},
+        chunk({"content": "b"}, token_ids=[2, 3]),
+    )
+
+    assert completion["choices"][0]["token_ids"] == [1, 2, 3]
+    assert completion["prompt_token_ids"] == [7, 8]
+
+
+def test_a_responses_stream_gives_the_response_of_its_last_event_that_holds_one() -> None:
+    final = {"id": "resp_1", "object": "response", "status": "completed", "output": [{"type": "message"}]}
+
+    completion = accumulated_events(
+        {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress", "output": []}},
+        {"type": "response.output_text.delta", "item_id": "m1", "delta": "hi"},
+        {"type": "response.completed", "response": final},
+    )
+
+    assert completion == final
+
+
+def test_a_messages_stream_gives_the_message_that_its_events_build() -> None:
+    completion = accumulated_events(
+        {
+            "type": "message_start",
+            "message": {"id": "msg_1", "type": "message", "role": "assistant", "content": [],
+                        "stop_reason": None, "usage": {"input_tokens": 9, "output_tokens": 0}},
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "add ✓ "}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "them"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "ping"},
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "add", "input": {}}},
+        {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"a\": "}},
+        {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "2}"}},
+        {"type": "content_block_stop", "index": 1},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 5},
+            "token_ids": [4, 5],
+        },
+        {"type": "message_stop"},
+    )
+
+    assert completion == {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "add ✓ them", "signature": "sig"},
+            {"type": "tool_use", "id": "toolu_1", "name": "add", "input": {"a": 2}},
+        ],
+        "stop_reason": "tool_use",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 9, "output_tokens": 5},
+        "token_ids": [4, 5],
+    }
+
+
+def test_an_error_event_is_the_completion_of_a_stream_that_gave_nothing_else() -> None:
+    error = {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}
+
+    assert accumulated_events(error) == error
