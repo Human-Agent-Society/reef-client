@@ -84,6 +84,8 @@ def has_tools(body: dict[str, Any] | None) -> bool:
 
 @dataclass
 class CapturedTurn:
+    """A proxied call. An explicit SSE failure sets ``stream_failed`` and keeps the upstream HTTP status."""
+
     session_id: str
     path: str
     status: int
@@ -93,6 +95,7 @@ class CapturedTurn:
     client_stream: bool
     duration_s: float
     at: float = field(default_factory=time.time)
+    stream_failed: bool = False
 
 
 class CaptureStore:
@@ -424,6 +427,7 @@ def build_handler(config: ServeConfig, store: CaptureStore) -> type[BaseHTTPRequ
                             receipt,
                             client_stream,
                             time.monotonic() - started,
+                            stream_failed=accumulator.stream_failed,
                         )
                     )
                 self._write_to_client(b"0\r\n\r\n")
