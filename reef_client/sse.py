@@ -21,6 +21,7 @@ Responses events and Anthropic Messages events.
 from __future__ import annotations
 
 import codecs
+import io
 import json
 from typing import Any
 
@@ -160,12 +161,16 @@ class SSEAccumulator:
     its deltas (``input_json_delta`` text becomes the block's ``input`` when the
     block stops), and ``message_delta`` sets its delta, adds its ``usage`` and sets
     each other field it holds. An ``error`` event of either stream is the
-    completion when the stream gave nothing else.
+    completion when the stream gave nothing else. ``stream_failed`` records an explicit protocol error
+    even when the stream gave part of an answer first.
     """
 
     def __init__(self) -> None:
-        self._decoder = codecs.getincrementaldecoder("utf-8")()
+        self._decoder = io.IncrementalNewlineDecoder(codecs.getincrementaldecoder("utf-8")(), translate=True)
         self._buffer = ""
+        self._event = ""
+        self._data: list[str] = []
+        self.stream_failed = False
         self.done = False
         self.id = ""
         self.model = ""
@@ -184,19 +189,32 @@ class SSEAccumulator:
         self._buffer += self._decoder.decode(data)
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
-            self._handle_line(line.strip())
+            self._handle_line(line)
 
     def finish(self) -> None:
         """Flush any trailing bytes once the response is exhausted."""
         tail = self._buffer + self._decoder.decode(b"", final=True)
         self._buffer = ""
-        if tail.strip():
-            self._handle_line(tail.strip())
+        for line in tail.split("\n"):
+            self._handle_line(line)
+        self._dispatch()
 
     def _handle_line(self, line: str) -> None:
-        if not line or line.startswith(":") or not line.startswith("data:"):
-            return  # blank separator, keepalive comment, or event:/id: field
-        data = line[len("data:") :].strip()
+        if not line:
+            self._dispatch()
+        elif line.startswith("event:"):
+            self._event = line[6:].removeprefix(" ")
+        elif line.startswith("data:"):
+            self._data.append(line[5:].removeprefix(" "))
+
+    def _dispatch(self) -> None:
+        event, lines = self._event, self._data
+        self._event, self._data = "", []
+        if not lines:
+            return
+        if event in ("error", "response.failed"):
+            self.stream_failed = True
+        data = "\n".join(lines).strip()
         if data == "[DONE]":
             self.done = True
             return
@@ -212,6 +230,8 @@ class SSEAccumulator:
 
     def _apply_chunk(self, chunk: dict[str, Any]) -> None:
         kind = chunk.get("type")
+        if kind in ("error", "response.failed") or (isinstance(chunk.get("error"), dict) and not chunk.get("choices")):
+            self.stream_failed = True
         if kind == "error":
             self._error = chunk
             return

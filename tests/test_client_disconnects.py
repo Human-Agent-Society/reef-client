@@ -29,6 +29,7 @@ CHUNKS = [
 
 class _Upstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    chunks = CHUNKS
 
     def log_message(self, *_args):  # quiet
         pass
@@ -40,7 +41,7 @@ class _Upstream(BaseHTTPRequestHandler):
         self.send_header("x-reef-agent-record-id", "receipt-1")
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        for chunk in CHUNKS:
+        for chunk in self.chunks:
             self.wfile.write(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
             self.wfile.flush()
         self.wfile.write(b"0\r\n\r\n")
@@ -109,3 +110,31 @@ def test_a_malformed_frame_costs_its_own_content_not_the_stream():
     accumulator.feed(b"data: [DONE]\n\n")
     accumulator.finish()
     assert accumulator.completion["choices"][0]["message"]["content"] == "hello"
+
+
+@pytest.mark.parametrize(
+    ("tail", "failed"),
+    [
+        (b"data: [DONE]\n\n", False),
+        (b'data: {"reason":\ndata: "unavailable"}\nevent: error\n\n', True),
+        (b'event: error\rdata: {"message":"unavailable"}\r\r', True),
+        (b'data: {"error":{"message":"unavailable"}}\n\n', True),
+        (b'data: {"type":"error","error":{"type":"overloaded_error"}}\n\n', True),
+        (b'data: {"type":"response.failed","response":{"status":"failed"}}\n\n', True),
+        (b'data: {"type":"response.incomplete","response":{"status":"incomplete"}}\n\n', False),
+        (b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"error":{"note":"metadata"}}\n\n', False),
+    ],
+)
+def test_capture_records_a_stream_failure_after_a_partial_answer(stack, monkeypatch, tail, failed):
+    url, store = stack
+    chunks = [CHUNKS[0], tail]
+    monkeypatch.setattr(_Upstream, "chunks", chunks)
+    request = urllib.request.Request(
+        f"{url}/v1/chat/completions",
+        data=json.dumps({"model": "m", "messages": [], "stream": True}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        assert response.status == 200 and response.read() == b"".join(chunks)
+    [turn] = store.snapshot()
+    assert turn["status"] == 200 and turn["stream_failed"] is failed

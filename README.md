@@ -30,7 +30,8 @@ import package is the inner [`reef_client/`](reef_client) directory:
 - [`serve.py`](reef_client/serve.py) is serve mode: a local sidecar that
   agents treat as their model endpoint (`python -m reef_client.serve`),
   owning session stamping, trajectory capture, receipt collection, and SSE
-  passthrough/synthesis so reef-oblivious agents need no SDK. See the
+  passthrough/synthesis so reef-oblivious agents need no SDK. Captured turns keep the upstream HTTP
+  status. An explicit SSE error sets `stream_failed`, including when part of the answer arrived first. See the
   [reference](https://github.com/Human-Agent-Society/reef/blob/main/docs/reference/reef-client.md#serve-mode-a-local-proxy-for-reef-oblivious-agents).
 
 The client and skill helpers are re-exported at the package root:
